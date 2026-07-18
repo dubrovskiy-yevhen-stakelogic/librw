@@ -300,7 +300,7 @@ im3DTransform(void *vertices, int32 numVertices, Matrix *world, uint32 flags)
 		SetRenderStatePtr(TEXTURERASTER, nil);
 
 #ifdef RW_GL_USE_VAOS
-	glBindVertexArray(im2DVao);
+	glBindVertexArray(im3DVao);
 #endif
 
 	im3DVertexBase = uploadStreamRange(GL_ARRAY_BUFFER, im3DVbo, vertices,

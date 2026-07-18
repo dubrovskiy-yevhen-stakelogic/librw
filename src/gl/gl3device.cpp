@@ -491,8 +491,10 @@ uint32
 bindTexture(uint32 texid)
 {
 	uint32 prev = boundTexture[activeTexture];
-	boundTexture[activeTexture] = texid;
-	glBindTexture(GL_TEXTURE_2D, texid);
+	if(prev != texid){
+		boundTexture[activeTexture] = texid;
+		glBindTexture(GL_TEXTURE_2D, texid);
+	}
 	return prev;
 }
 
@@ -557,7 +559,7 @@ setAddressU(uint32 stage, int32 addressing)
 		Raster *raster = rwStateCache.texstage[stage].raster;
 		if(raster){
 			Gl3Raster *natras = PLUGINOFFSET(Gl3Raster, raster, nativeRasterOffset);
-			if(natras->addressU == addressing){
+			if(natras->addressU != addressing){
 				setActiveTexture(stage);
 				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, addressConvMap[addressing]);
 				natras->addressU = addressing;
@@ -574,7 +576,7 @@ setAddressV(uint32 stage, int32 addressing)
 		Raster *raster = rwStateCache.texstage[stage].raster;
 		if(raster){
 			Gl3Raster *natras = PLUGINOFFSET(Gl3Raster, rwStateCache.texstage[stage].raster, nativeRasterOffset);
-			if(natras->addressV == addressing){
+			if(natras->addressV != addressing){
 				setActiveTexture(stage);
 				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, addressConvMap[addressing]);
 				natras->addressV = addressing;
@@ -1091,6 +1093,7 @@ setMaterial(const RGBA &color, const SurfaceProperties &surfaceprops, float extr
 		surfProps[3] = extraSurfProp;
 		glUniform4fv(U(u_surfProps), 1, surfProps);
 		shaderState.surfProps = surfaceprops;
+		shaderState.extraSurfProp = extraSurfProp;
 	}
 }
 
@@ -1394,26 +1397,30 @@ clearCamera(Camera *cam, RGBA *col, uint32 mode)
 		mask |= GL_DEPTH_BUFFER_BIT;
 	if(mode & Camera::CLEARSTENCIL)
 		mask |= GL_STENCIL_BUFFER_BIT;
-	glDepthMask(GL_TRUE);
+	if(!rwStateCache.zwrite)
+		glDepthMask(GL_TRUE);
 	glClear(mask);
-	glDepthMask(rwStateCache.zwrite);
+	if(!rwStateCache.zwrite)
+		glDepthMask(GL_FALSE);
 }
 
 static void
 showRaster(Raster *raster, uint32 flags)
 {
 	// TODO: do this properly!
+	static int32 currentSwapInterval = -1;
+	const int32 requestedSwapInterval = (flags & Raster::FLIPWAITVSYNCH) ? 1 : 0;
+	if(currentSwapInterval != requestedSwapInterval){
 #ifdef LIBRW_SDL2
-	if(flags & Raster::FLIPWAITVSYNCH)
-		SDL_GL_SetSwapInterval(1);
-	else
-		SDL_GL_SetSwapInterval(0);
+		SDL_GL_SetSwapInterval(requestedSwapInterval);
+#else
+		glfwSwapInterval(requestedSwapInterval);
+#endif
+		currentSwapInterval = requestedSwapInterval;
+	}
+#ifdef LIBRW_SDL2
 	SDL_GL_SwapWindow(glGlobals.window);
 #else
-	if(flags & Raster::FLIPWAITVSYNCH)
-		glfwSwapInterval(1);
-	else
-		glfwSwapInterval(0);
 	glfwSwapBuffers(glGlobals.window);
 #endif
 }

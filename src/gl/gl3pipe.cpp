@@ -31,7 +31,7 @@ freeInstanceData(Geometry *geometry)
 	glDeleteBuffers(1, &header->ibo);
 	glDeleteBuffers(1, &header->vbo);
 #ifdef RW_GL_USE_VAOS
-	glDeleteBuffers(1, &header->vao);
+	glDeleteVertexArrays(1, &header->vao);
 #endif
 	rwFree(header->indexBuffer);
 	rwFree(header->vertexBuffer);
