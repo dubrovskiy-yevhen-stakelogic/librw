@@ -45,6 +45,9 @@ struct D3D12Raster
 	uint32 levelStride[MAX_MIP_LEVELS];
 	uint32 numLevels;
 	uint32 lockedLevel;
+	uint32 srvIndex;
+	uint32 rtvIndex;
+	uint32 dsvIndex;
 	bool32 hasAlpha;
 };
 
@@ -133,7 +136,8 @@ createTextureResource(Raster *raster, D3D12Raster *nativeRaster)
 	nativeRaster->state = initialState;
 
 	if(!allocateShaderResourceDescriptor(&nativeRaster->srvCpu,
-	                                     &nativeRaster->srvGpu))
+	                                     &nativeRaster->srvGpu,
+	                                     &nativeRaster->srvIndex))
 		return 0;
 	D3D12_SHADER_RESOURCE_VIEW_DESC srv;
 	memset(&srv, 0, sizeof(srv));
@@ -145,7 +149,8 @@ createTextureResource(Raster *raster, D3D12Raster *nativeRaster)
 	                                 nativeRaster->srvCpu);
 
 	if(raster->type == Raster::CAMERATEXTURE){
-		if(!allocateRenderTargetDescriptor(&nativeRaster->rtv))
+		if(!allocateRenderTargetDescriptor(&nativeRaster->rtv,
+		                                  &nativeRaster->rtvIndex))
 			return 0;
 		device->CreateRenderTargetView(nativeRaster->resource, nil,
 		                               nativeRaster->rtv);
@@ -175,7 +180,8 @@ createDepthResource(Raster *raster, D3D12Raster *nativeRaster)
 	       IID_PPV_ARGS(&nativeRaster->resource))))
 		return 0;
 	nativeRaster->state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-	if(!allocateDepthDescriptor(&nativeRaster->dsv))
+	if(!allocateDepthDescriptor(&nativeRaster->dsv,
+	                          &nativeRaster->dsvIndex))
 		return 0;
 	device->CreateDepthStencilView(nativeRaster->resource, nil,
 	                               nativeRaster->dsv);
@@ -275,6 +281,110 @@ uploadLevel(Raster *raster, D3D12Raster *nativeRaster, uint32 level)
 	releaseCom(list);
 	releaseCom(allocator);
 	releaseCom(upload);
+	return ok;
+}
+
+static bool32
+readbackCameraTextureLevel(D3D12Raster *nativeRaster, uint32 level,
+	                       uint8 *pixels, uint32 stride)
+{
+	ID3D12Device *device = getDevice();
+	ID3D12CommandQueue *queue = getCommandQueue();
+	if(device == nil || queue == nil || nativeRaster->resource == nil ||
+	   pixels == nil || level >= nativeRaster->numLevels ||
+	   !prepareForReadback())
+		return 0;
+
+	D3D12_RESOURCE_DESC texture = nativeRaster->resource->GetDesc();
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+	UINT rows = 0;
+	UINT64 rowSize = 0;
+	UINT64 bufferSize = 0;
+	device->GetCopyableFootprints(&texture, level, 1, 0, &footprint,
+	                             &rows, &rowSize, &bufferSize);
+	D3D12_RESOURCE_DESC buffer;
+	memset(&buffer, 0, sizeof(buffer));
+	buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	buffer.Width = bufferSize;
+	buffer.Height = 1;
+	buffer.DepthOrArraySize = 1;
+	buffer.MipLevels = 1;
+	buffer.SampleDesc.Count = 1;
+	buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	D3D12_HEAP_PROPERTIES readbackProps =
+		heapProperties(D3D12_HEAP_TYPE_READBACK);
+	ID3D12Resource *readback = nil;
+	ID3D12CommandAllocator *allocator = nil;
+	ID3D12GraphicsCommandList *list = nil;
+	bool32 ok = SUCCEEDED(device->CreateCommittedResource(
+		&readbackProps, D3D12_HEAP_FLAG_NONE, &buffer,
+		D3D12_RESOURCE_STATE_COPY_DEST, nil, IID_PPV_ARGS(&readback))) &&
+		SUCCEEDED(device->CreateCommandAllocator(
+			D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) &&
+		SUCCEEDED(device->CreateCommandList(
+			0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nil,
+			IID_PPV_ARGS(&list)));
+	D3D12_RESOURCE_STATES previousState = nativeRaster->state;
+	if(ok && previousState != D3D12_RESOURCE_STATE_COPY_SOURCE){
+		D3D12_RESOURCE_BARRIER barrier = transitionBarrier(
+			nativeRaster->resource, previousState,
+			D3D12_RESOURCE_STATE_COPY_SOURCE);
+		list->ResourceBarrier(1, &barrier);
+	}
+	if(ok){
+		D3D12_TEXTURE_COPY_LOCATION dst;
+		memset(&dst, 0, sizeof(dst));
+		dst.pResource = readback;
+		dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		dst.PlacedFootprint = footprint;
+		D3D12_TEXTURE_COPY_LOCATION src;
+		memset(&src, 0, sizeof(src));
+		src.pResource = nativeRaster->resource;
+		src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		src.SubresourceIndex = level;
+		list->CopyTextureRegion(&dst, 0, 0, 0, &src, nil);
+		if(previousState != D3D12_RESOURCE_STATE_COPY_SOURCE){
+			D3D12_RESOURCE_BARRIER barrier = transitionBarrier(
+				nativeRaster->resource, D3D12_RESOURCE_STATE_COPY_SOURCE,
+				previousState);
+			list->ResourceBarrier(1, &barrier);
+		}
+		ok = SUCCEEDED(list->Close());
+	}
+	if(ok){
+		ID3D12CommandList *lists[] = { list };
+		queue->ExecuteCommandLists(1, lists);
+		ok = waitForGpu();
+	}
+	if(ok){
+		uint8 *mapped = nil;
+		D3D12_RANGE range = {
+			(SIZE_T)footprint.Offset,
+			(SIZE_T)(footprint.Offset + footprint.Footprint.RowPitch*rows)
+		};
+		ok = SUCCEEDED(readback->Map(0, &range, (void**)&mapped));
+		if(ok){
+			uint32 width = nativeRaster->levelStride[level]/4;
+			for(UINT row = 0; row < rows; row++){
+				uint8 *src = mapped + footprint.Offset +
+					row*footprint.Footprint.RowPitch;
+				uint8 *dst = pixels + row*stride;
+				// Camera textures use R8G8B8A8 on the GPU; the librw raster
+				// lock contract for C8888 exposes BGRA bytes.
+				for(uint32 x = 0; x < width; x++){
+					dst[x*4] = src[x*4+2];
+					dst[x*4+1] = src[x*4+1];
+					dst[x*4+2] = src[x*4];
+					dst[x*4+3] = src[x*4+3];
+				}
+			}
+			D3D12_RANGE written = { 0, 0 };
+			readback->Unmap(0, &written);
+		}
+	}
+	releaseCom(list);
+	releaseCom(allocator);
+	releaseCom(readback);
 	return ok;
 }
 
@@ -386,9 +496,24 @@ rasterLock(Raster *raster, int32 level, int32 lockMode)
 	if(raster->pixels == nil)
 		return nil;
 	if((lockMode & Raster::LOCKNOFETCH) == 0 ||
-	   (lockMode & Raster::LOCKREAD))
-		memcpy(raster->pixels, nativeRaster->backingStore[level],
-		       nativeRaster->levelSize[level]);
+	   (lockMode & Raster::LOCKREAD)){
+		if(raster->type == Raster::CAMERATEXTURE &&
+		   (lockMode & Raster::LOCKREAD)){
+			if(!readbackCameraTextureLevel(nativeRaster, level,
+			                                  raster->pixels, raster->stride)){
+				rwFree(raster->pixels);
+				raster->pixels = raster->originalPixels;
+				raster->width = raster->originalWidth;
+				raster->height = raster->originalHeight;
+				raster->stride = raster->originalStride;
+				return nil;
+			}
+			memcpy(nativeRaster->backingStore[level], raster->pixels,
+			       nativeRaster->levelSize[level]);
+		}else
+			memcpy(raster->pixels, nativeRaster->backingStore[level],
+			       nativeRaster->levelSize[level]);
+	}
 	nativeRaster->lockedLevel = level;
 	raster->privateFlags = lockMode;
 	return raster->pixels;
@@ -503,6 +628,19 @@ Image*
 rasterToImage(Raster *raster)
 {
 #ifdef RW_D3D12
+	if(raster->type == Raster::CAMERA){
+		Image *image = Image::create(raster->width, raster->height, 32);
+		if(image == nil)
+			return nil;
+		image->allocate();
+		if(image->pixels == nil ||
+		   !readPresentedFrame(image->pixels, image->stride,
+		                       image->width, image->height)){
+			image->destroy();
+			return nil;
+		}
+		return image;
+	}
 	if(raster->type != Raster::NORMAL && raster->type != Raster::TEXTURE &&
 	   raster->type != Raster::CAMERATEXTURE)
 		return nil;
@@ -628,6 +766,9 @@ createNativeRaster(void *object, int32 offset, int32)
 #ifdef RW_D3D12
 	D3D12Raster *raster = PLUGINOFFSET(D3D12Raster, object, offset);
 	memset(raster, 0, sizeof(*raster));
+	raster->srvIndex = UINT32_MAX;
+	raster->rtvIndex = UINT32_MAX;
+	raster->dsvIndex = UINT32_MAX;
 #endif
 	return object;
 }
@@ -638,7 +779,12 @@ destroyNativeRaster(void *object, int32 offset, int32)
 #ifdef RW_D3D12
 	D3D12Raster *raster = PLUGINOFFSET(D3D12Raster, object, offset);
 	deferRelease(raster->resource);
+	deferDescriptorRelease(raster->srvIndex, raster->rtvIndex,
+	                       raster->dsvIndex);
 	raster->resource = nil;
+	raster->srvIndex = raster->rtvIndex = raster->dsvIndex = UINT32_MAX;
+	raster->srvCpu.ptr = raster->srvGpu.ptr = 0;
+	raster->rtv.ptr = raster->dsv.ptr = 0;
 	for(uint32 i = 0; i < MAX_MIP_LEVELS; i++){
 		if(raster->backingStore[i]){
 			rwFree(raster->backingStore[i]);
@@ -655,6 +801,9 @@ copyNativeRaster(void *dst, void*, int32 offset, int32)
 #ifdef RW_D3D12
 	D3D12Raster *raster = PLUGINOFFSET(D3D12Raster, dst, offset);
 	memset(raster, 0, sizeof(*raster));
+	raster->srvIndex = UINT32_MAX;
+	raster->rtvIndex = UINT32_MAX;
+	raster->dsvIndex = UINT32_MAX;
 #endif
 	return dst;
 }

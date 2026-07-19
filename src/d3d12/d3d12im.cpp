@@ -55,6 +55,8 @@ enum {
 	BLEND_REPLACE,
 	BLEND_KEEP_DESTINATION,
 	BLEND_MODULATE_DESTINATION,
+	BLEND_ALPHA_INVERSE_DEST_ALPHA,
+	BLEND_DEST_ALPHA_INVERSE_DEST_ALPHA,
 	BLEND_MODE_COUNT
 };
 enum {
@@ -152,25 +154,40 @@ compileShader(const char *source, const char *entry, const char *target,
 }
 
 static bool32
-getPipelineBlend(uint32 mode, D3D12_BLEND *source, D3D12_BLEND *destination)
+getPipelineBlend(uint32 mode, D3D12_BLEND *source, D3D12_BLEND *destination,
+	             D3D12_BLEND *sourceAlpha, D3D12_BLEND *destinationAlpha)
 {
 	switch(mode){
 	case BLEND_ADD_ONE:
-		*source = D3D12_BLEND_ONE; *destination = D3D12_BLEND_ONE; break;
+		*source = D3D12_BLEND_ONE; *destination = D3D12_BLEND_ONE;
+		*sourceAlpha = D3D12_BLEND_ONE; *destinationAlpha = D3D12_BLEND_ONE; break;
 	case BLEND_ADD_ALPHA:
-		*source = D3D12_BLEND_SRC_ALPHA; *destination = D3D12_BLEND_ONE; break;
+		*source = D3D12_BLEND_SRC_ALPHA; *destination = D3D12_BLEND_ONE;
+		*sourceAlpha = D3D12_BLEND_SRC_ALPHA; *destinationAlpha = D3D12_BLEND_ONE; break;
 	case BLEND_SHADOW:
-		*source = D3D12_BLEND_ZERO; *destination = D3D12_BLEND_INV_SRC_COLOR; break;
+		*source = D3D12_BLEND_ZERO; *destination = D3D12_BLEND_INV_SRC_COLOR;
+		*sourceAlpha = D3D12_BLEND_ZERO; *destinationAlpha = D3D12_BLEND_INV_SRC_ALPHA; break;
 	case BLEND_INVERSE_DEST:
-		*source = D3D12_BLEND_INV_DEST_COLOR; *destination = D3D12_BLEND_ZERO; break;
+		*source = D3D12_BLEND_INV_DEST_COLOR; *destination = D3D12_BLEND_ZERO;
+		*sourceAlpha = D3D12_BLEND_INV_DEST_ALPHA; *destinationAlpha = D3D12_BLEND_ZERO; break;
 	case BLEND_REPLACE:
-		*source = D3D12_BLEND_ONE; *destination = D3D12_BLEND_ZERO; break;
+		*source = D3D12_BLEND_ONE; *destination = D3D12_BLEND_ZERO;
+		*sourceAlpha = D3D12_BLEND_ONE; *destinationAlpha = D3D12_BLEND_ZERO; break;
 	case BLEND_KEEP_DESTINATION:
-		*source = D3D12_BLEND_ZERO; *destination = D3D12_BLEND_ONE; break;
+		*source = D3D12_BLEND_ZERO; *destination = D3D12_BLEND_ONE;
+		*sourceAlpha = D3D12_BLEND_ZERO; *destinationAlpha = D3D12_BLEND_ONE; break;
 	case BLEND_MODULATE_DESTINATION:
-		*source = D3D12_BLEND_ZERO; *destination = D3D12_BLEND_SRC_COLOR; break;
+		*source = D3D12_BLEND_ZERO; *destination = D3D12_BLEND_SRC_COLOR;
+		*sourceAlpha = D3D12_BLEND_ZERO; *destinationAlpha = D3D12_BLEND_SRC_ALPHA; break;
+	case BLEND_ALPHA_INVERSE_DEST_ALPHA:
+		*source = D3D12_BLEND_SRC_ALPHA; *destination = D3D12_BLEND_INV_DEST_ALPHA;
+		*sourceAlpha = D3D12_BLEND_SRC_ALPHA; *destinationAlpha = D3D12_BLEND_INV_DEST_ALPHA; break;
+	case BLEND_DEST_ALPHA_INVERSE_DEST_ALPHA:
+		*source = D3D12_BLEND_DEST_ALPHA; *destination = D3D12_BLEND_INV_DEST_ALPHA;
+		*sourceAlpha = D3D12_BLEND_DEST_ALPHA; *destinationAlpha = D3D12_BLEND_INV_DEST_ALPHA; break;
 	default:
-		*source = D3D12_BLEND_SRC_ALPHA; *destination = D3D12_BLEND_INV_SRC_ALPHA; break;
+		*source = D3D12_BLEND_SRC_ALPHA; *destination = D3D12_BLEND_INV_SRC_ALPHA;
+		*sourceAlpha = D3D12_BLEND_SRC_ALPHA; *destinationAlpha = D3D12_BLEND_INV_SRC_ALPHA; break;
 	}
 	return 1;
 }
@@ -194,6 +211,10 @@ getActiveBlendMode(void)
 		return BLEND_KEEP_DESTINATION;
 	if(source == (void*)BLENDZERO && destination == (void*)BLENDSRCCOLOR)
 		return BLEND_MODULATE_DESTINATION;
+	if(source == (void*)BLENDSRCALPHA && destination == (void*)BLENDINVDESTALPHA)
+		return BLEND_ALPHA_INVERSE_DEST_ALPHA;
+	if(source == (void*)BLENDDESTALPHA && destination == (void*)BLENDINVDESTALPHA)
+		return BLEND_DEST_ALPHA_INVERSE_DEST_ALPHA;
 	return BLEND_ALPHA;
 }
 
@@ -279,10 +300,10 @@ createPipeline(ID3D12Device *device, D3D12_PRIMITIVE_TOPOLOGY_TYPE type,
 	desc.RasterizerState.DepthClipEnable = TRUE;
 	desc.BlendState.RenderTarget[0].BlendEnable = TRUE;
 	getPipelineBlend(blendMode, &desc.BlendState.RenderTarget[0].SrcBlend,
-	                 &desc.BlendState.RenderTarget[0].DestBlend);
+	                 &desc.BlendState.RenderTarget[0].DestBlend,
+	                 &desc.BlendState.RenderTarget[0].SrcBlendAlpha,
+	                 &desc.BlendState.RenderTarget[0].DestBlendAlpha);
 	desc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
-	desc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
-	desc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
 	desc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
 	desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
 		D3D12_COLOR_WRITE_ENABLE_ALL;
@@ -324,10 +345,10 @@ createIm3DPipeline(ID3D12Device *device,
 	desc.RasterizerState.DepthClipEnable = TRUE;
 	desc.BlendState.RenderTarget[0].BlendEnable = TRUE;
 	getPipelineBlend(blendMode, &desc.BlendState.RenderTarget[0].SrcBlend,
-	                 &desc.BlendState.RenderTarget[0].DestBlend);
+	                 &desc.BlendState.RenderTarget[0].DestBlend,
+	                 &desc.BlendState.RenderTarget[0].SrcBlendAlpha,
+	                 &desc.BlendState.RenderTarget[0].DestBlendAlpha);
 	desc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
-	desc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
-	desc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
 	desc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
 	desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
 		D3D12_COLOR_WRITE_ENABLE_ALL;
@@ -801,7 +822,8 @@ initializeImmediate(void)
 		"float4 PSMain(VSOut input) : SV_TARGET {"
 		" float4 color = input.color;"
 		" if(drawFlags.x > 0.5) color *= image.Sample(imageSampler, input.uv);"
-		" clip(color.a - 0.02);"
+		" if(drawFlags.z > 1.5) clip(drawFlags.y - color.a - 0.000001);"
+		" else if(drawFlags.z > 0.5) clip(color.a - drawFlags.y);"
 		" float3 fogColor = float3(fogColorPacked & 255u,"
 		" (fogColorPacked >> 8) & 255u, (fogColorPacked >> 16) & 255u) / 255.0;"
 		" color.rgb = lerp(fogColor, color.rgb, input.fogFactor);"
@@ -1382,6 +1404,8 @@ drawIm3D(PrimitiveType type, uint16 *indices, int32 numIndices)
 		return;
 	}
 	constants[48] = textured ? 1.0f : 0.0f;
+	constants[49] = (uint32)(uintptr_t)getRenderState(ALPHATESTREF)/255.0f;
+	constants[50] = (float)(uint32)(uintptr_t)getRenderState(ALPHATESTFUNC);
 	if(getRenderState(FOGENABLE) != nil &&
 	   camera->fogPlane < camera->farPlane){
 		constants[52] = camera->farPlane;

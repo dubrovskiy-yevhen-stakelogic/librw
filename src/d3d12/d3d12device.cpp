@@ -24,20 +24,9 @@
 namespace rw {
 namespace d3d12 {
 
-static void
-traceStage(const char *message)
-{
-	FILE *file = fopen("d3d12_stage5_trace.log", "a");
-	if(file){
-		fprintf(file, "%s\n", message);
-		fclose(file);
-	}
-}
-
 static void*
 driverOpen(void *object, int32, int32)
 {
-	traceStage("driverOpen begin");
 	Driver *driver = engine->driver[PLATFORM_D3D12];
 	driver->rasterNativeOffset = nativeRasterOffset;
 	driver->rasterCreate = rasterCreate;
@@ -49,12 +38,9 @@ driverOpen(void *object, int32, int32)
 	driver->imageFindRasterFormat = imageFindRasterFormat;
 	driver->rasterFromImage = rasterFromImage;
 	driver->rasterToImage = rasterToImage;
-	traceStage("driverOpen callbacks ready");
 	driver->defaultPipeline = makeDefaultPipeline();
-	traceStage("driverOpen pipeline returned");
 #ifdef RW_D3D12
 	initializeImmediate();
-	traceStage("driverOpen immediate renderer returned");
 #endif
 	return object;
 }
@@ -125,6 +111,7 @@ struct D3D12Context
 	UINT nextSrvDescriptor;
 	UINT nextSamplerDescriptor;
 	UINT frameIndex;
+	UINT lastPresentedFrame;
 	int32 width;
 	int32 height;
 	int32 desktopWidth;
@@ -135,15 +122,27 @@ struct D3D12Context
 	bool32 presentationReady;
 	bool32 frameOpen;
 	bool32 backBufferRendering;
+	bool32 hasPresentedFrame;
 	D3D12_GPU_DESCRIPTOR_HANDLE samplerCache[SAMPLER_FILTER_COUNT][SAMPLER_ADDRESS_COUNT][SAMPLER_ADDRESS_COUNT];
 	Raster *currentColorRaster;
 	ID3D12Resource *currentColorResource;
 	D3D12_CPU_DESCRIPTOR_HANDLE currentColorView;
 	D3D12_CPU_DESCRIPTOR_HANDLE currentDepthView;
 	std::vector<IUnknown*> deferredReleases[FRAME_COUNT];
+	std::vector<uint32> deferredSrvDescriptors[FRAME_COUNT];
+	std::vector<uint32> deferredRtvDescriptors[FRAME_COUNT];
+	std::vector<uint32> deferredDsvDescriptors[FRAME_COUNT];
+	std::vector<uint32> freeSrvDescriptors;
+	std::vector<uint32> freeRtvDescriptors;
+	std::vector<uint32> freeDsvDescriptors;
 };
 
 static D3D12Context context;
+
+static D3D12_RESOURCE_BARRIER transitionBarrier(
+	ID3D12Resource *resource, D3D12_RESOURCE_STATES before,
+	D3D12_RESOURCE_STATES after);
+static void finishFrame(void);
 
 template<class T>
 static void
@@ -200,6 +199,119 @@ getPresentSize(int32 *width, int32 *height)
 		*height = context.height;
 }
 
+bool32
+readPresentedFrame(uint8 *pixels, uint32 stride, int32 width, int32 height)
+{
+	if(!context.presentationReady || !context.hasPresentedFrame ||
+	   pixels == nil || width <= 0 || height <= 0 ||
+	   context.lastPresentedFrame >= FRAME_COUNT)
+		return 0;
+	// Screenshot capture runs after showRaster. Keep this path defensive for
+	// callers that request a capture between EndUpdate and presentation.
+	if(context.frameOpen)
+		finishFrame();
+	if(!waitForGpu())
+		return 0;
+
+	ID3D12Resource *source = context.backBuffers[context.lastPresentedFrame];
+	if(source == nil)
+		return 0;
+	D3D12_RESOURCE_DESC texture = source->GetDesc();
+	UINT copyWidth = (UINT)(width < (int32)texture.Width ? width : texture.Width);
+	UINT copyHeight = (UINT)(height < (int32)texture.Height ? height : texture.Height);
+	if(copyWidth == 0 || copyHeight == 0 || stride < copyWidth*4)
+		return 0;
+
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+	UINT rows = 0;
+	UINT64 rowSize = 0;
+	UINT64 bufferSize = 0;
+	context.device->GetCopyableFootprints(&texture, 0, 1, 0, &footprint,
+	                                      &rows, &rowSize, &bufferSize);
+	D3D12_HEAP_PROPERTIES heap;
+	memset(&heap, 0, sizeof(heap));
+	heap.Type = D3D12_HEAP_TYPE_READBACK;
+	heap.CreationNodeMask = 1;
+	heap.VisibleNodeMask = 1;
+	D3D12_RESOURCE_DESC buffer;
+	memset(&buffer, 0, sizeof(buffer));
+	buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	buffer.Width = bufferSize;
+	buffer.Height = 1;
+	buffer.DepthOrArraySize = 1;
+	buffer.MipLevels = 1;
+	buffer.SampleDesc.Count = 1;
+	buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	ID3D12Resource *readback = nil;
+	ID3D12CommandAllocator *allocator = nil;
+	ID3D12GraphicsCommandList *list = nil;
+	bool32 ok = SUCCEEDED(context.device->CreateCommittedResource(
+		&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+		nil, IID_PPV_ARGS(&readback))) &&
+		SUCCEEDED(context.device->CreateCommandAllocator(
+			D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) &&
+		SUCCEEDED(context.device->CreateCommandList(
+			0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nil,
+			IID_PPV_ARGS(&list)));
+	if(ok){
+		D3D12_RESOURCE_BARRIER toCopy = transitionBarrier(
+			source, D3D12_RESOURCE_STATE_PRESENT,
+			D3D12_RESOURCE_STATE_COPY_SOURCE);
+		list->ResourceBarrier(1, &toCopy);
+		D3D12_TEXTURE_COPY_LOCATION dst;
+		memset(&dst, 0, sizeof(dst));
+		dst.pResource = readback;
+		dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		dst.PlacedFootprint = footprint;
+		D3D12_TEXTURE_COPY_LOCATION src;
+		memset(&src, 0, sizeof(src));
+		src.pResource = source;
+		src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		D3D12_BOX box = { 0, 0, 0, copyWidth, copyHeight, 1 };
+		list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+		D3D12_RESOURCE_BARRIER toPresent = transitionBarrier(
+			source, D3D12_RESOURCE_STATE_COPY_SOURCE,
+			D3D12_RESOURCE_STATE_PRESENT);
+		list->ResourceBarrier(1, &toPresent);
+		ok = SUCCEEDED(list->Close());
+	}
+	if(ok){
+		ID3D12CommandList *lists[] = { list };
+		context.queue->ExecuteCommandLists(1, lists);
+		ok = waitForGpu();
+	}
+	if(ok){
+		uint8 *mapped = nil;
+		D3D12_RANGE readRange = {
+			(SIZE_T)footprint.Offset,
+			(SIZE_T)(footprint.Offset + footprint.Footprint.RowPitch*copyHeight)
+		};
+		ok = SUCCEEDED(readback->Map(0, &readRange, (void**)&mapped));
+		if(ok){
+			for(UINT row = 0; row < copyHeight; row++)
+				memcpy(pixels + row*stride,
+				       mapped + footprint.Offset + row*footprint.Footprint.RowPitch,
+				       copyWidth*4);
+			D3D12_RANGE writtenRange = { 0, 0 };
+			readback->Unmap(0, &writtenRange);
+		}
+	}
+	releaseCom(list);
+	releaseCom(allocator);
+	releaseCom(readback);
+	return ok;
+}
+
+bool32
+prepareForReadback(void)
+{
+	if(context.device == nil || context.queue == nil)
+		return 0;
+	if(context.frameOpen)
+		finishFrame();
+	return waitForGpu();
+}
+
 static void
 releaseDeferredFrame(uint32 frame)
 {
@@ -208,6 +320,18 @@ releaseDeferredFrame(uint32 frame)
 	for(size_t i = 0; i < context.deferredReleases[frame].size(); i++)
 		context.deferredReleases[frame][i]->Release();
 	context.deferredReleases[frame].clear();
+	context.freeSrvDescriptors.insert(context.freeSrvDescriptors.end(),
+		context.deferredSrvDescriptors[frame].begin(),
+		context.deferredSrvDescriptors[frame].end());
+	context.freeRtvDescriptors.insert(context.freeRtvDescriptors.end(),
+		context.deferredRtvDescriptors[frame].begin(),
+		context.deferredRtvDescriptors[frame].end());
+	context.freeDsvDescriptors.insert(context.freeDsvDescriptors.end(),
+		context.deferredDsvDescriptors[frame].begin(),
+		context.deferredDsvDescriptors[frame].end());
+	context.deferredSrvDescriptors[frame].clear();
+	context.deferredRtvDescriptors[frame].clear();
+	context.deferredDsvDescriptors[frame].clear();
 }
 
 void
@@ -222,18 +346,42 @@ deferRelease(IUnknown *object)
 	context.deferredReleases[context.frameIndex % FRAME_COUNT].push_back(object);
 }
 
+void
+deferDescriptorRelease(uint32 srvIndex, uint32 rtvIndex, uint32 dsvIndex)
+{
+	if(context.device == nil)
+		return;
+	uint32 frame = context.frameIndex % FRAME_COUNT;
+	if(srvIndex != UINT32_MAX)
+		context.deferredSrvDescriptors[frame].push_back(srvIndex);
+	if(rtvIndex != UINT32_MAX && rtvIndex >= FRAME_COUNT)
+		context.deferredRtvDescriptors[frame].push_back(rtvIndex);
+	if(dsvIndex != UINT32_MAX)
+		context.deferredDsvDescriptors[frame].push_back(dsvIndex);
+}
+
 bool32
 allocateShaderResourceDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE *cpu,
-	                             D3D12_GPU_DESCRIPTOR_HANDLE *gpu)
+	                             D3D12_GPU_DESCRIPTOR_HANDLE *gpu,
+	                             uint32 *allocatedIndex)
 {
-	if(context.srvHeap == nil || cpu == nil || gpu == nil ||
-	   context.nextSrvDescriptor >= MAX_SHADER_RESOURCE_DESCRIPTORS)
+	if(context.srvHeap == nil || cpu == nil || gpu == nil)
 		return 0;
+	uint32 index;
+	if(!context.freeSrvDescriptors.empty()){
+		index = context.freeSrvDescriptors.back();
+		context.freeSrvDescriptors.pop_back();
+	}else{
+		if(context.nextSrvDescriptor >= MAX_SHADER_RESOURCE_DESCRIPTORS)
+			return 0;
+		index = context.nextSrvDescriptor++;
+	}
 	*cpu = context.srvHeap->GetCPUDescriptorHandleForHeapStart();
 	*gpu = context.srvHeap->GetGPUDescriptorHandleForHeapStart();
-	cpu->ptr += (SIZE_T)context.nextSrvDescriptor*context.srvDescriptorSize;
-	gpu->ptr += (UINT64)context.nextSrvDescriptor*context.srvDescriptorSize;
-	context.nextSrvDescriptor++;
+	cpu->ptr += (SIZE_T)index*context.srvDescriptorSize;
+	gpu->ptr += (UINT64)index*context.srvDescriptorSize;
+	if(allocatedIndex)
+		*allocatedIndex = index;
 	return 1;
 }
 
@@ -296,26 +444,46 @@ getSamplerView(uint32 filter, uint32 addressU, uint32 addressV,
 }
 
 bool32
-allocateDepthDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE *cpu)
+allocateDepthDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE *cpu,
+	                    uint32 *allocatedIndex)
 {
-	if(context.dsvHeap == nil || cpu == nil ||
-	   context.nextDsvDescriptor >= MAX_DEPTH_DESCRIPTORS)
+	if(context.dsvHeap == nil || cpu == nil)
 		return 0;
+	uint32 index;
+	if(!context.freeDsvDescriptors.empty()){
+		index = context.freeDsvDescriptors.back();
+		context.freeDsvDescriptors.pop_back();
+	}else{
+		if(context.nextDsvDescriptor >= MAX_DEPTH_DESCRIPTORS)
+			return 0;
+		index = context.nextDsvDescriptor++;
+	}
 	*cpu = context.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-	cpu->ptr += (SIZE_T)context.nextDsvDescriptor*context.dsvDescriptorSize;
-	context.nextDsvDescriptor++;
+	cpu->ptr += (SIZE_T)index*context.dsvDescriptorSize;
+	if(allocatedIndex)
+		*allocatedIndex = index;
 	return 1;
 }
 
 bool32
-allocateRenderTargetDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE *cpu)
+allocateRenderTargetDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE *cpu,
+	                           uint32 *allocatedIndex)
 {
-	if(context.rtvHeap == nil || cpu == nil ||
-	   context.nextRtvDescriptor >= MAX_RENDER_TARGET_DESCRIPTORS)
+	if(context.rtvHeap == nil || cpu == nil)
 		return 0;
+	uint32 index;
+	if(!context.freeRtvDescriptors.empty()){
+		index = context.freeRtvDescriptors.back();
+		context.freeRtvDescriptors.pop_back();
+	}else{
+		if(context.nextRtvDescriptor >= MAX_RENDER_TARGET_DESCRIPTORS)
+			return 0;
+		index = context.nextRtvDescriptor++;
+	}
 	*cpu = context.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-	cpu->ptr += (SIZE_T)context.nextRtvDescriptor*context.rtvDescriptorSize;
-	context.nextRtvDescriptor++;
+	cpu->ptr += (SIZE_T)index*context.rtvDescriptorSize;
+	if(allocatedIndex)
+		*allocatedIndex = index;
 	return 1;
 }
 
@@ -450,6 +618,8 @@ destroyFrameResources(void)
 	context.rtvDescriptorSize = 0;
 	context.nextRtvDescriptor = FRAME_COUNT;
 	context.frameIndex = 0;
+	context.lastPresentedFrame = 0;
+	context.hasPresentedFrame = 0;
 	context.presentationReady = 0;
 }
 
@@ -520,6 +690,68 @@ createFrameResources(void)
 	return 1;
 }
 
+static bool32
+resizeFrameResources(int32 width, int32 height)
+{
+	if(!context.presentationReady || context.swapChain == nil ||
+	   width <= 0 || height <= 0)
+		return 0;
+	if(width == context.width && height == context.height)
+		return 1;
+	if(context.frameOpen)
+		finishFrame();
+	if(!waitForGpu())
+		return 0;
+	for(uint32 i = 0; i < FRAME_COUNT; i++){
+		releaseDeferredFrame(i);
+		releaseCom(context.backBuffers[i]);
+		context.frameFenceValues[i] = 0;
+	}
+	context.currentColorRaster = nil;
+	context.currentColorResource = nil;
+	context.currentColorView.ptr = 0;
+	context.currentDepthView.ptr = 0;
+	context.backBufferRendering = 0;
+	context.hasPresentedFrame = 0;
+	HRESULT hr = context.swapChain->ResizeBuffers(
+		FRAME_COUNT, (UINT)width, (UINT)height,
+		DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+	if(FAILED(hr)){
+		context.presentationReady = 0;
+		return 0;
+	}
+	for(uint32 i = 0; i < FRAME_COUNT; i++){
+		if(FAILED(context.swapChain->GetBuffer(
+		       i, IID_PPV_ARGS(&context.backBuffers[i])))){
+			context.presentationReady = 0;
+			return 0;
+		}
+		context.device->CreateRenderTargetView(
+			context.backBuffers[i], nil, context.rtvHandles[i]);
+	}
+	context.width = width;
+	context.height = height;
+	context.frameIndex = context.swapChain->GetCurrentBackBufferIndex();
+	context.lastPresentedFrame = context.frameIndex;
+	return 1;
+}
+
+static bool32
+refreshFrameSize(void)
+{
+	if(context.window == nil)
+		return 1;
+	RECT rect;
+	if(!GetClientRect(context.window, &rect))
+		return 1;
+	int32 width = rect.right - rect.left;
+	int32 height = rect.bottom - rect.top;
+	if(width <= 0 || height <= 0 ||
+	   (width == context.width && height == context.height))
+		return 1;
+	return resizeFrameResources(width, height);
+}
+
 static D3D12_RESOURCE_BARRIER
 transitionBarrier(ID3D12Resource *resource, D3D12_RESOURCE_STATES before,
 	              D3D12_RESOURCE_STATES after)
@@ -537,7 +769,7 @@ transitionBarrier(ID3D12Resource *resource, D3D12_RESOURCE_STATES before,
 static bool32
 beginFrame(Camera *camera)
 {
-	if(!context.presentationReady)
+	if(!context.presentationReady || !refreshFrameSize())
 		return 0;
 	if(!context.frameOpen){
 		context.frameIndex = context.swapChain->GetCurrentBackBufferIndex();
@@ -717,7 +949,11 @@ showRaster(Raster*, uint32)
 		return;
 	if(context.frameOpen)
 		finishFrame();
-	context.swapChain->Present(1, 0);
+	UINT presentedFrame = context.frameIndex;
+	if(FAILED(context.swapChain->Present(1, 0)))
+		return;
+	context.lastPresentedFrame = presentedFrame;
+	context.hasPresentedFrame = 1;
 	context.frameIndex = context.swapChain->GetCurrentBackBufferIndex();
 }
 
@@ -803,6 +1039,14 @@ destroyCoreDevice(void)
 	context.nextSrvDescriptor = 0;
 	context.nextSamplerDescriptor = 0;
 	context.nextDsvDescriptor = 0;
+	context.freeSrvDescriptors.clear();
+	context.freeRtvDescriptors.clear();
+	context.freeDsvDescriptors.clear();
+	for(uint32 i = 0; i < FRAME_COUNT; i++){
+		context.deferredSrvDescriptors[i].clear();
+		context.deferredRtvDescriptors[i].clear();
+		context.deferredDsvDescriptors[i].clear();
+	}
 	memset(context.samplerCache, 0, sizeof(context.samplerCache));
 	context.initialized = 0;
 }
@@ -810,7 +1054,6 @@ destroyCoreDevice(void)
 static bool32
 createCoreDevice(void)
 {
-	traceStage("createCoreDevice begin");
 	if(context.initialized)
 		return 1;
 
@@ -826,14 +1069,12 @@ createCoreDevice(void)
 
 	if(FAILED(CreateDXGIFactory2(factoryFlags, IID_PPV_ARGS(&context.factory))))
 		return 0;
-	traceStage("createCoreDevice factory ready");
 	context.factory->QueryInterface(IID_PPV_ARGS(&context.factory6));
 
 	if(!selectAdapter()){
 		destroyCoreDevice();
 		return 0;
 	}
-	traceStage("createCoreDevice adapter ready");
 
 	D3D12_COMMAND_QUEUE_DESC queueDesc;
 	memset(&queueDesc, 0, sizeof(queueDesc));
@@ -853,7 +1094,6 @@ createCoreDevice(void)
 		destroyCoreDevice();
 		return 0;
 	}
-	traceStage("createCoreDevice queue and fence ready");
 	D3D12_DESCRIPTOR_HEAP_DESC srvDesc;
 	memset(&srvDesc, 0, sizeof(srvDesc));
 	srvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -883,15 +1123,11 @@ createCoreDevice(void)
 		D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
 	context.dsvDescriptorSize = context.device->GetDescriptorHandleIncrementSize(
 		D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-	traceStage("createCoreDevice descriptor heaps ready");
 	if(!createFrameResources()){
 		destroyCoreDevice();
 		return 0;
 	}
-	traceStage("createCoreDevice frame resources ready");
 	context.initialized = 1;
-	printf("librw D3D12: initialized %s (%s)\n", context.adapterName,
-	       context.presentationReady ? "swapchain ready" : "headless");
 	return 1;
 }
 
@@ -919,7 +1155,6 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 	VideoMode *mode;
 	switch(req){
 	case DEVICEOPEN:
-		traceStage("DEVICEOPEN");
 		context.window = (HWND)((EngineOpenParams*)arg)->window;
 		context.width = 1280;
 		context.height = 720;
@@ -949,7 +1184,6 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 		context.window = nil;
 		return 1;
 	case DEVICEINIT:
-		traceStage("DEVICEINIT");
 		// psSelectDevice changes the HWND after DEVICEOPEN. Read the final client
 		// area here so the swap chain matches the RenderWare camera pixel-for-pixel.
 		if(context.window){
@@ -959,13 +1193,6 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 				context.width = rect.right - rect.left;
 				context.height = rect.bottom - rect.top;
 			}
-		}
-		{
-			char videoTrace[96];
-			snprintf(videoTrace, sizeof(videoTrace),
-			         "DEVICEINIT client=%dx%d mode=%d", context.width,
-			         context.height, context.currentVideoMode);
-			traceStage(videoTrace);
 		}
 		return createCoreDevice();
 	case DEVICETERM:

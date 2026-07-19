@@ -28,16 +28,6 @@
 namespace rw {
 namespace d3d12 {
 
-static void
-tracePipeline(const char *message)
-{
-	FILE *file = fopen("d3d12_stage5_trace.log", "a");
-	if(file){
-		fprintf(file, "%s\n", message);
-		fclose(file);
-	}
-}
-
 #ifdef RW_D3D12
 
 struct Vertex
@@ -83,6 +73,8 @@ enum WorldBlendMode {
 	WORLD_BLEND_REPLACE,
 	WORLD_BLEND_KEEP_DESTINATION,
 	WORLD_BLEND_MODULATE_DESTINATION,
+	WORLD_BLEND_ALPHA_INVERSE_DEST_ALPHA,
+	WORLD_BLEND_DEST_ALPHA_INVERSE_DEST_ALPHA,
 	WORLD_BLEND_COUNT
 };
 enum WorldDepthMode {
@@ -210,41 +202,71 @@ compileShader(const char *source, const char *entry, const char *target,
 
 static void
 getWorldPipelineBlend(uint32 mode, D3D12_BLEND *source,
-                      D3D12_BLEND *destination)
+                      D3D12_BLEND *destination,
+                      D3D12_BLEND *sourceAlpha,
+                      D3D12_BLEND *destinationAlpha)
 {
 	switch(mode){
 	case WORLD_BLEND_ADD_ONE:
 		*source = D3D12_BLEND_ONE;
 		*destination = D3D12_BLEND_ONE;
+		*sourceAlpha = D3D12_BLEND_ONE;
+		*destinationAlpha = D3D12_BLEND_ONE;
 		break;
 	case WORLD_BLEND_ADD_ALPHA:
 		*source = D3D12_BLEND_SRC_ALPHA;
 		*destination = D3D12_BLEND_ONE;
+		*sourceAlpha = D3D12_BLEND_SRC_ALPHA;
+		*destinationAlpha = D3D12_BLEND_ONE;
 		break;
 	case WORLD_BLEND_SHADOW:
 		*source = D3D12_BLEND_ZERO;
 		*destination = D3D12_BLEND_INV_SRC_COLOR;
+		*sourceAlpha = D3D12_BLEND_ZERO;
+		*destinationAlpha = D3D12_BLEND_INV_SRC_ALPHA;
 		break;
 	case WORLD_BLEND_INVERSE_DEST:
 		*source = D3D12_BLEND_INV_DEST_COLOR;
 		*destination = D3D12_BLEND_ZERO;
+		*sourceAlpha = D3D12_BLEND_INV_DEST_ALPHA;
+		*destinationAlpha = D3D12_BLEND_ZERO;
 		break;
 	case WORLD_BLEND_REPLACE:
 		*source = D3D12_BLEND_ONE;
 		*destination = D3D12_BLEND_ZERO;
+		*sourceAlpha = D3D12_BLEND_ONE;
+		*destinationAlpha = D3D12_BLEND_ZERO;
 		break;
 	case WORLD_BLEND_KEEP_DESTINATION:
 		*source = D3D12_BLEND_ZERO;
 		*destination = D3D12_BLEND_ONE;
+		*sourceAlpha = D3D12_BLEND_ZERO;
+		*destinationAlpha = D3D12_BLEND_ONE;
 		break;
 	case WORLD_BLEND_MODULATE_DESTINATION:
 		*source = D3D12_BLEND_ZERO;
 		*destination = D3D12_BLEND_SRC_COLOR;
+		*sourceAlpha = D3D12_BLEND_ZERO;
+		*destinationAlpha = D3D12_BLEND_SRC_ALPHA;
+		break;
+	case WORLD_BLEND_ALPHA_INVERSE_DEST_ALPHA:
+		*source = D3D12_BLEND_SRC_ALPHA;
+		*destination = D3D12_BLEND_INV_DEST_ALPHA;
+		*sourceAlpha = D3D12_BLEND_SRC_ALPHA;
+		*destinationAlpha = D3D12_BLEND_INV_DEST_ALPHA;
+		break;
+	case WORLD_BLEND_DEST_ALPHA_INVERSE_DEST_ALPHA:
+		*source = D3D12_BLEND_DEST_ALPHA;
+		*destination = D3D12_BLEND_INV_DEST_ALPHA;
+		*sourceAlpha = D3D12_BLEND_DEST_ALPHA;
+		*destinationAlpha = D3D12_BLEND_INV_DEST_ALPHA;
 		break;
 	case WORLD_BLEND_ALPHA:
 	default:
 		*source = D3D12_BLEND_SRC_ALPHA;
 		*destination = D3D12_BLEND_INV_SRC_ALPHA;
+		*sourceAlpha = D3D12_BLEND_SRC_ALPHA;
+		*destinationAlpha = D3D12_BLEND_INV_SRC_ALPHA;
 		break;
 	}
 }
@@ -268,13 +290,16 @@ getWorldBlendMode(void)
 		return WORLD_BLEND_KEEP_DESTINATION;
 	if(source == (void*)BLENDZERO && destination == (void*)BLENDSRCCOLOR)
 		return WORLD_BLEND_MODULATE_DESTINATION;
+	if(source == (void*)BLENDSRCALPHA && destination == (void*)BLENDINVDESTALPHA)
+		return WORLD_BLEND_ALPHA_INVERSE_DEST_ALPHA;
+	if(source == (void*)BLENDDESTALPHA && destination == (void*)BLENDINVDESTALPHA)
+		return WORLD_BLEND_DEST_ALPHA_INVERSE_DEST_ALPHA;
 	return WORLD_BLEND_ALPHA;
 }
 
 static bool32
 createPipelineResources(void)
 {
-	tracePipeline("pipeline resources begin");
 	if(pipelineReady)
 		return 1;
 	ID3D12Device *device = getDevice();
@@ -337,7 +362,6 @@ createPipelineResources(void)
 	releaseCom(serialized);
 	if(FAILED(hr))
 		return 0;
-	tracePipeline("pipeline root signature ready");
 
 	static const char *shaderSource =
 		"cbuffer DrawConstants : register(b0) {"
@@ -411,7 +435,6 @@ createPipelineResources(void)
 		releaseCom(pixelShader);
 		return 0;
 	}
-	tracePipeline("pipeline shaders ready");
 
 	D3D12_INPUT_ELEMENT_DESC input[] = {
 		{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,
@@ -462,7 +485,9 @@ createPipelineResources(void)
 			blend != WORLD_BLEND_OPAQUE;
 		getWorldPipelineBlend(blend,
 			&pso.BlendState.RenderTarget[0].SrcBlend,
-			&pso.BlendState.RenderTarget[0].DestBlend);
+			&pso.BlendState.RenderTarget[0].DestBlend,
+			&pso.BlendState.RenderTarget[0].SrcBlendAlpha,
+			&pso.BlendState.RenderTarget[0].DestBlendAlpha);
 		for(uint32 depth = 0; depth < WORLD_DEPTH_COUNT && SUCCEEDED(hr); depth++){
 			const bool depthTest = depth == WORLD_DEPTH_TEST_ONLY ||
 			                       depth == WORLD_DEPTH_TEST_WRITE;
@@ -492,7 +517,6 @@ createPipelineResources(void)
 					releaseCom(worldPipelines[blend][depth][cull]);
 		return 0;
 	}
-	tracePipeline("pipeline PSO ready");
 
 	D3D12_HEAP_PROPERTIES boneProps = uploadHeapProperties();
 	D3D12_RESOURCE_DESC boneBuffer = bufferDesc(BONE_UPLOAD_SIZE);
@@ -517,9 +541,7 @@ createPipelineResources(void)
 	white->destroy();
 	if(whiteRaster == nil)
 		return 0;
-	tracePipeline("pipeline white raster ready");
 	pipelineReady = 1;
-	printf("librw D3D12: default world pipeline ready\n");
 	return 1;
 }
 
@@ -792,11 +814,6 @@ uploadSkinMatrices(Atomic *atomic, D3D12_GPU_VIRTUAL_ADDRESS *address,
 	Skin *skin = atomic && atomic->geometry ? Skin::get(atomic->geometry) : nil;
 	*isSkinned = skin != nil && skin->numBones > 0 &&
 		skin->inverseMatrices != nil;
-	static bool32 tracedFirstSkin;
-	if(*isSkinned && !tracedFirstSkin){
-		tracePipeline("pipeline first skinned draw");
-		tracedFirstSkin = 1;
-	}
 	if(!*isSkinned){
 		uint32 frame = getFrameIndex() % BONE_FRAME_COUNT;
 		if(boneArenas[frame].resource == nil)
@@ -843,11 +860,6 @@ enum MeshSelection {
 static bool32
 renderGeometry(Atomic *atomic, MeshSelection selection, uint8 fadeAlpha)
 {
-	static bool32 tracedFirstDraw;
-	if(!tracedFirstDraw){
-		tracePipeline("pipeline first render request");
-		tracedFirstDraw = 1;
-	}
 	if(!pipelineReady || atomic == nil || atomic->geometry == nil ||
 	   !instanceGeometry(atomic->geometry))
 		return 0;
@@ -882,16 +894,6 @@ renderGeometry(Atomic *atomic, MeshSelection selection, uint8 fadeAlpha)
 		constants[57] = 1.0f/(camera->fogPlane - camera->farPlane);
 	}
 	uint32 packedFog = (uint32)(uintptr_t)getRenderState(FOGCOLOR);
-	static bool32 tracedFogParameters;
-	if(!tracedFogParameters){
-		char message[192];
-		snprintf(message, sizeof(message),
-		         "fog camera start=%.3f end=%.3f range=%.8f state=%d color=%08X",
-		         camera->fogPlane, camera->farPlane, constants[57],
-		         getRenderState(FOGENABLE) != nil, packedFog);
-		tracePipeline(message);
-		tracedFogParameters = 1;
-	}
 	list->SetGraphicsRootConstantBufferView(2, boneAddress);
 	LightingConstants lighting;
 	collectLighting(atomic, &lighting);
