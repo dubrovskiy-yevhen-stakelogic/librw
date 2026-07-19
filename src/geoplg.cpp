@@ -16,6 +16,7 @@
 #include "d3d/rwxbox.h"
 #include "d3d/rwd3d8.h"
 #include "d3d/rwd3d9.h"
+#include "d3d12/rwd3d12.h"
 #include "gl/rwwdgl.h"
 #include "gl/rwgl3.h"
 
@@ -251,6 +252,8 @@ destroyNativeData(void *object, int32 offset, int32 size)
 		return d3d9::destroyNativeData(object, offset, size);
 	if(geometry->instData->platform == PLATFORM_GL3)
 		return gl3::destroyNativeData(object, offset, size);
+	if(geometry->instData->platform == PLATFORM_D3D12)
+		return d3d12::destroyNativeData(object, offset, size);
 	return object;
 }
 

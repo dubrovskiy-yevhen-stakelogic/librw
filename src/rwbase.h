@@ -27,6 +27,10 @@
 #define RWHALFPIXEL
 #endif
 
+#ifdef RW_D3D12
+#define RWDEVICE d3d12
+#endif
+
 #ifdef RW_D3D8
 #define RWDEVICE d3d
 #endif
@@ -539,6 +543,7 @@ enum Platform
 
 	PLATFORM_WDGL = 11,	// WarDrum OpenGL
 	PLATFORM_GL3  = 12,	// my GL3 implementation
+	PLATFORM_D3D12 = 13,	// modern explicit Windows backend
 
 	NUM_PLATFORMS,
 
@@ -612,6 +617,7 @@ enum PluginID
 	ID_RASTERD3D9    = MAKEPLUGINID(VEND_RASTER, PLATFORM_D3D9),
 	ID_RASTERWDGL    = MAKEPLUGINID(VEND_RASTER, PLATFORM_WDGL),
 	ID_RASTERGL3     = MAKEPLUGINID(VEND_RASTER, PLATFORM_GL3),
+	ID_RASTERD3D12   = MAKEPLUGINID(VEND_RASTER, PLATFORM_D3D12),
 
 	// anything driver/device related (only as allocation tag)
 	ID_DRIVER        = MAKEPLUGINID(VEND_DRIVER, 0)

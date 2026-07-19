@@ -38,7 +38,8 @@ workspace "librw"
 	filter { "system:windows" }
 		configurations { "ReleaseStatic" }
 		platforms { "win-x86-null", "win-x86-gl3", "win-x86-d3d9",
-			"win-amd64-null", "win-amd64-gl3", "win-amd64-d3d9" }
+			"win-amd64-null", "win-amd64-gl3", "win-amd64-d3d9",
+			"win-amd64-d3d12" }
 	filter { "system:linux" }
 		platforms { "linux-x86-null", "linux-x86-gl3",
 		"linux-amd64-null", "linux-amd64-gl3",
@@ -67,6 +68,8 @@ workspace "librw"
 		end
 	filter { "platforms:*d3d9" }
 		defines { "RW_D3D9" }
+	filter { "platforms:*d3d12" }
+		defines { "RW_D3D12" }
 	filter { "platforms:ps2" }
 		defines { "RW_PS2" }
 		toolset "gcc"
@@ -151,6 +154,8 @@ function findlibs()
 		links { "gdi32", "d3d9" }
 	filter { "platforms:*d3d9", "action:vs*" }
 		links { "Xinput9_1_0" }
+	filter { "platforms:win*d3d12" }
+		links { "d3d12", "dxgi", "dxguid", "user32" }
 	filter {}
 end
 
