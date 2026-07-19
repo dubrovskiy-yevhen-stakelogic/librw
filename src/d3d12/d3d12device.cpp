@@ -89,7 +89,10 @@ enum {
 	FRAME_COUNT = 3,
 	MAX_RENDER_TARGET_DESCRIPTORS = 256,
 	MAX_DEPTH_DESCRIPTORS = 128,
-	MAX_SHADER_RESOURCE_DESCRIPTORS = 16384
+	MAX_SHADER_RESOURCE_DESCRIPTORS = 16384,
+	MAX_SAMPLER_DESCRIPTORS = 128,
+	SAMPLER_FILTER_COUNT = 7,
+	SAMPLER_ADDRESS_COUNT = 5
 };
 
 struct D3D12Context
@@ -105,6 +108,7 @@ struct D3D12Context
 	ID3D12DescriptorHeap *rtvHeap;
 	ID3D12DescriptorHeap *dsvHeap;
 	ID3D12DescriptorHeap *srvHeap;
+	ID3D12DescriptorHeap *samplerHeap;
 	ID3D12Resource *backBuffers[FRAME_COUNT];
 	ID3D12CommandAllocator *commandAllocators[FRAME_COUNT];
 	ID3D12GraphicsCommandList *commandList;
@@ -115,9 +119,11 @@ struct D3D12Context
 	UINT rtvDescriptorSize;
 	UINT dsvDescriptorSize;
 	UINT srvDescriptorSize;
+	UINT samplerDescriptorSize;
 	UINT nextRtvDescriptor;
 	UINT nextDsvDescriptor;
 	UINT nextSrvDescriptor;
+	UINT nextSamplerDescriptor;
 	UINT frameIndex;
 	int32 width;
 	int32 height;
@@ -129,6 +135,7 @@ struct D3D12Context
 	bool32 presentationReady;
 	bool32 frameOpen;
 	bool32 backBufferRendering;
+	D3D12_GPU_DESCRIPTOR_HANDLE samplerCache[SAMPLER_FILTER_COUNT][SAMPLER_ADDRESS_COUNT][SAMPLER_ADDRESS_COUNT];
 	Raster *currentColorRaster;
 	ID3D12Resource *currentColorResource;
 	D3D12_CPU_DESCRIPTOR_HANDLE currentColorView;
@@ -170,6 +177,12 @@ ID3D12DescriptorHeap*
 getShaderResourceHeap(void)
 {
 	return context.srvHeap;
+}
+
+ID3D12DescriptorHeap*
+getSamplerHeap(void)
+{
+	return context.samplerHeap;
 }
 
 uint32
@@ -221,6 +234,64 @@ allocateShaderResourceDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE *cpu,
 	cpu->ptr += (SIZE_T)context.nextSrvDescriptor*context.srvDescriptorSize;
 	gpu->ptr += (UINT64)context.nextSrvDescriptor*context.srvDescriptorSize;
 	context.nextSrvDescriptor++;
+	return 1;
+}
+
+bool32
+getSamplerView(uint32 filter, uint32 addressU, uint32 addressV,
+               D3D12_GPU_DESCRIPTOR_HANDLE *gpu)
+{
+	if(context.samplerHeap == nil || context.device == nil || gpu == nil)
+		return 0;
+	if(filter < 1 || filter >= SAMPLER_FILTER_COUNT)
+		filter = 2;
+	if(addressU < 1 || addressU >= SAMPLER_ADDRESS_COUNT)
+		addressU = 1;
+	if(addressV < 1 || addressV >= SAMPLER_ADDRESS_COUNT)
+		addressV = 1;
+	D3D12_GPU_DESCRIPTOR_HANDLE &cached =
+		context.samplerCache[filter][addressU][addressV];
+	if(cached.ptr != 0){
+		*gpu = cached;
+		return 1;
+	}
+	if(context.nextSamplerDescriptor >= MAX_SAMPLER_DESCRIPTORS)
+		return 0;
+
+	static const D3D12_FILTER filters[SAMPLER_FILTER_COUNT] = {
+		D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+		D3D12_FILTER_MIN_MAG_MIP_POINT,
+		D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+		D3D12_FILTER_MIN_MAG_MIP_POINT,
+		D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+		D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR,
+		D3D12_FILTER_MIN_MAG_MIP_LINEAR
+	};
+	static const D3D12_TEXTURE_ADDRESS_MODE addresses[SAMPLER_ADDRESS_COUNT] = {
+		D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+		D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+		D3D12_TEXTURE_ADDRESS_MODE_MIRROR,
+		D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+		D3D12_TEXTURE_ADDRESS_MODE_BORDER
+	};
+	D3D12_SAMPLER_DESC desc;
+	memset(&desc, 0, sizeof(desc));
+	desc.Filter = filters[filter];
+	desc.AddressU = addresses[addressU];
+	desc.AddressV = addresses[addressV];
+	desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+	desc.MaxAnisotropy = 1;
+	desc.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+	desc.MinLOD = 0.0f;
+	desc.MaxLOD = D3D12_FLOAT32_MAX;
+	D3D12_CPU_DESCRIPTOR_HANDLE cpu =
+		context.samplerHeap->GetCPUDescriptorHandleForHeapStart();
+	cached = context.samplerHeap->GetGPUDescriptorHandleForHeapStart();
+	cpu.ptr += (SIZE_T)context.nextSamplerDescriptor*context.samplerDescriptorSize;
+	cached.ptr += (UINT64)context.nextSamplerDescriptor*context.samplerDescriptorSize;
+	context.nextSamplerDescriptor++;
+	context.device->CreateSampler(&desc, cpu);
+	*gpu = cached;
 	return 1;
 }
 
@@ -484,9 +555,11 @@ beginFrame(Camera *camera)
 			D3D12_RESOURCE_STATE_RENDER_TARGET);
 		context.commandList->ResourceBarrier(1, &barrier);
 		context.backBufferRendering = 1;
-		if(context.srvHeap){
-			ID3D12DescriptorHeap *heaps[] = { context.srvHeap };
-			context.commandList->SetDescriptorHeaps(1, heaps);
+		if(context.srvHeap && context.samplerHeap){
+			ID3D12DescriptorHeap *heaps[] = {
+				context.srvHeap, context.samplerHeap
+			};
+			context.commandList->SetDescriptorHeaps(2, heaps);
 		}
 		context.frameOpen = 1;
 	}
@@ -593,7 +666,8 @@ clearCamera(Camera *camera, RGBA *color, uint32 mode)
 	}
 	if((mode & Camera::CLEARZ) && context.currentDepthView.ptr)
 		context.commandList->ClearDepthStencilView(
-			context.currentDepthView, D3D12_CLEAR_FLAG_DEPTH,
+			context.currentDepthView,
+			D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
 			1.0f, 0, 0, nil);
 }
 
@@ -715,6 +789,7 @@ destroyCoreDevice(void)
 	}
 	releaseCom(context.fence);
 	releaseCom(context.srvHeap);
+	releaseCom(context.samplerHeap);
 	releaseCom(context.dsvHeap);
 	releaseCom(context.queue);
 	releaseCom(context.device);
@@ -723,9 +798,12 @@ destroyCoreDevice(void)
 	releaseCom(context.factory);
 	context.fenceValue = 0;
 	context.srvDescriptorSize = 0;
+	context.samplerDescriptorSize = 0;
 	context.dsvDescriptorSize = 0;
 	context.nextSrvDescriptor = 0;
+	context.nextSamplerDescriptor = 0;
 	context.nextDsvDescriptor = 0;
+	memset(context.samplerCache, 0, sizeof(context.samplerCache));
 	context.initialized = 0;
 }
 
@@ -785,8 +863,15 @@ createCoreDevice(void)
 	memset(&dsvDesc, 0, sizeof(dsvDesc));
 	dsvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
 	dsvDesc.NumDescriptors = MAX_DEPTH_DESCRIPTORS;
+	D3D12_DESCRIPTOR_HEAP_DESC samplerDesc;
+	memset(&samplerDesc, 0, sizeof(samplerDesc));
+	samplerDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+	samplerDesc.NumDescriptors = MAX_SAMPLER_DESCRIPTORS;
+	samplerDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 	if(FAILED(context.device->CreateDescriptorHeap(
 	       &srvDesc, IID_PPV_ARGS(&context.srvHeap))) ||
+	   FAILED(context.device->CreateDescriptorHeap(
+	       &samplerDesc, IID_PPV_ARGS(&context.samplerHeap))) ||
 	   FAILED(context.device->CreateDescriptorHeap(
 	       &dsvDesc, IID_PPV_ARGS(&context.dsvHeap)))){
 		destroyCoreDevice();
@@ -794,6 +879,8 @@ createCoreDevice(void)
 	}
 	context.srvDescriptorSize = context.device->GetDescriptorHandleIncrementSize(
 		D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+	context.samplerDescriptorSize = context.device->GetDescriptorHandleIncrementSize(
+		D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
 	context.dsvDescriptorSize = context.device->GetDescriptorHandleIncrementSize(
 		D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 	traceStage("createCoreDevice descriptor heaps ready");

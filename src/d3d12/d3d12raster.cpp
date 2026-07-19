@@ -161,12 +161,13 @@ createDepthResource(Raster *raster, D3D12Raster *nativeRaster)
 		return 0;
 
 	D3D12_RESOURCE_DESC desc = textureDesc(
-		raster->width, raster->height, 1, DXGI_FORMAT_D32_FLOAT,
+		raster->width, raster->height, 1, DXGI_FORMAT_D24_UNORM_S8_UINT,
 		D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
 	D3D12_CLEAR_VALUE clearValue;
 	memset(&clearValue, 0, sizeof(clearValue));
-	clearValue.Format = DXGI_FORMAT_D32_FLOAT;
+	clearValue.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
 	clearValue.DepthStencil.Depth = 1.0f;
+	clearValue.DepthStencil.Stencil = 0;
 	D3D12_HEAP_PROPERTIES props = heapProperties(D3D12_HEAP_TYPE_DEFAULT);
 	if(FAILED(device->CreateCommittedResource(
 	       &props, D3D12_HEAP_FLAG_NONE, &desc,
@@ -178,8 +179,8 @@ createDepthResource(Raster *raster, D3D12Raster *nativeRaster)
 		return 0;
 	device->CreateDepthStencilView(nativeRaster->resource, nil,
 	                               nativeRaster->dsv);
-	raster->format = Raster::D32;
-	raster->depth = 32;
+	raster->format = Raster::D24;
+	raster->depth = 24;
 	return 1;
 }
 

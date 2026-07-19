@@ -76,15 +76,29 @@ static ID3D12RootSignature *rootSignature;
 enum WorldBlendMode {
 	WORLD_BLEND_OPAQUE,
 	WORLD_BLEND_ALPHA,
-	WORLD_BLEND_ADDITIVE,
+	WORLD_BLEND_ADD_ONE,
+	WORLD_BLEND_ADD_ALPHA,
+	WORLD_BLEND_SHADOW,
+	WORLD_BLEND_INVERSE_DEST,
+	WORLD_BLEND_REPLACE,
+	WORLD_BLEND_KEEP_DESTINATION,
+	WORLD_BLEND_MODULATE_DESTINATION,
 	WORLD_BLEND_COUNT
 };
 enum WorldDepthMode {
-	WORLD_DEPTH_NO_WRITE,
-	WORLD_DEPTH_WRITE,
+	WORLD_DEPTH_DISABLED,
+	WORLD_DEPTH_WRITE_ONLY,
+	WORLD_DEPTH_TEST_ONLY,
+	WORLD_DEPTH_TEST_WRITE,
 	WORLD_DEPTH_COUNT
 };
-static ID3D12PipelineState *worldPipelines[WORLD_BLEND_COUNT][WORLD_DEPTH_COUNT];
+enum WorldCullMode {
+	WORLD_CULL_NONE,
+	WORLD_CULL_BACK,
+	WORLD_CULL_FRONT,
+	WORLD_CULL_COUNT
+};
+static ID3D12PipelineState *worldPipelines[WORLD_BLEND_COUNT][WORLD_DEPTH_COUNT][WORLD_CULL_COUNT];
 static Raster *whiteRaster;
 static bool32 pipelineReady;
 
@@ -194,6 +208,69 @@ compileShader(const char *source, const char *entry, const char *target,
 	return SUCCEEDED(hr);
 }
 
+static void
+getWorldPipelineBlend(uint32 mode, D3D12_BLEND *source,
+                      D3D12_BLEND *destination)
+{
+	switch(mode){
+	case WORLD_BLEND_ADD_ONE:
+		*source = D3D12_BLEND_ONE;
+		*destination = D3D12_BLEND_ONE;
+		break;
+	case WORLD_BLEND_ADD_ALPHA:
+		*source = D3D12_BLEND_SRC_ALPHA;
+		*destination = D3D12_BLEND_ONE;
+		break;
+	case WORLD_BLEND_SHADOW:
+		*source = D3D12_BLEND_ZERO;
+		*destination = D3D12_BLEND_INV_SRC_COLOR;
+		break;
+	case WORLD_BLEND_INVERSE_DEST:
+		*source = D3D12_BLEND_INV_DEST_COLOR;
+		*destination = D3D12_BLEND_ZERO;
+		break;
+	case WORLD_BLEND_REPLACE:
+		*source = D3D12_BLEND_ONE;
+		*destination = D3D12_BLEND_ZERO;
+		break;
+	case WORLD_BLEND_KEEP_DESTINATION:
+		*source = D3D12_BLEND_ZERO;
+		*destination = D3D12_BLEND_ONE;
+		break;
+	case WORLD_BLEND_MODULATE_DESTINATION:
+		*source = D3D12_BLEND_ZERO;
+		*destination = D3D12_BLEND_SRC_COLOR;
+		break;
+	case WORLD_BLEND_ALPHA:
+	default:
+		*source = D3D12_BLEND_SRC_ALPHA;
+		*destination = D3D12_BLEND_INV_SRC_ALPHA;
+		break;
+	}
+}
+
+static uint32
+getWorldBlendMode(void)
+{
+	void *source = getRenderState(SRCBLEND);
+	void *destination = getRenderState(DESTBLEND);
+	if(source == (void*)BLENDONE && destination == (void*)BLENDONE)
+		return WORLD_BLEND_ADD_ONE;
+	if(source == (void*)BLENDSRCALPHA && destination == (void*)BLENDONE)
+		return WORLD_BLEND_ADD_ALPHA;
+	if(source == (void*)BLENDZERO && destination == (void*)BLENDINVSRCCOLOR)
+		return WORLD_BLEND_SHADOW;
+	if(source == (void*)BLENDINVDESTCOLOR && destination == (void*)BLENDZERO)
+		return WORLD_BLEND_INVERSE_DEST;
+	if(source == (void*)BLENDONE && destination == (void*)BLENDZERO)
+		return WORLD_BLEND_REPLACE;
+	if(source == (void*)BLENDZERO && destination == (void*)BLENDONE)
+		return WORLD_BLEND_KEEP_DESTINATION;
+	if(source == (void*)BLENDZERO && destination == (void*)BLENDSRCCOLOR)
+		return WORLD_BLEND_MODULATE_DESTINATION;
+	return WORLD_BLEND_ALPHA;
+}
+
 static bool32
 createPipelineResources(void)
 {
@@ -204,45 +281,42 @@ createPipelineResources(void)
 	if(device == nil)
 		return 0;
 
-	D3D12_DESCRIPTOR_RANGE range;
-	memset(&range, 0, sizeof(range));
-	range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-	range.NumDescriptors = 1;
-	range.BaseShaderRegister = 0;
-	range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+	D3D12_DESCRIPTOR_RANGE ranges[2];
+	memset(ranges, 0, sizeof(ranges));
+	ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	ranges[0].NumDescriptors = 1;
+	ranges[0].BaseShaderRegister = 0;
+	ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+	ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+	ranges[1].NumDescriptors = 1;
+	ranges[1].BaseShaderRegister = 0;
+	ranges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-	D3D12_ROOT_PARAMETER params[4];
+	D3D12_ROOT_PARAMETER params[5];
 	memset(params, 0, sizeof(params));
 	params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 	params[0].Constants.ShaderRegister = 0;
-	params[0].Constants.Num32BitValues = 59;
+	params[0].Constants.Num32BitValues = 58;
 	params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 	params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 	params[1].DescriptorTable.NumDescriptorRanges = 1;
-	params[1].DescriptorTable.pDescriptorRanges = &range;
+	params[1].DescriptorTable.pDescriptorRanges = &ranges[0];
 	params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 	params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
 	params[2].Descriptor.ShaderRegister = 1;
 	params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 	params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
 	params[3].Descriptor.ShaderRegister = 2;
-	params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-
-	D3D12_STATIC_SAMPLER_DESC sampler;
-	memset(&sampler, 0, sizeof(sampler));
-	sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-	sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-	sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-	sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-	sampler.MaxLOD = D3D12_FLOAT32_MAX;
-	sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+	params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	params[4].DescriptorTable.NumDescriptorRanges = 1;
+	params[4].DescriptorTable.pDescriptorRanges = &ranges[1];
+	params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
 	D3D12_ROOT_SIGNATURE_DESC signature;
 	memset(&signature, 0, sizeof(signature));
-	signature.NumParameters = 4;
+	signature.NumParameters = 5;
 	signature.pParameters = params;
-	signature.NumStaticSamplers = 1;
-	signature.pStaticSamplers = &sampler;
 	signature.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 	ID3DBlob *serialized = nil;
 	ID3DBlob *errors = nil;
@@ -269,7 +343,7 @@ createPipelineResources(void)
 		"cbuffer DrawConstants : register(b0) {"
 		" row_major float4x4 world; row_major float4x4 view;"
 		" row_major float4x4 projection; float4 materialColor; float4 drawFlags;"
-		" float fogEnd; float fogRange; uint fogColorPacked; };"
+		" float fogEnd; float fogRange; };"
 		"cbuffer SkinConstants : register(b1) { row_major float4x4 bones[64]; };"
 		"cbuffer LightingConstants : register(b2) { float4 ambientLight;"
 		" float4 surfaceProps; float4 lightColorRadius[8];"
@@ -322,9 +396,11 @@ createPipelineResources(void)
 		"float4 PSMain(VSOut input) : SV_TARGET {"
 		" float4 color = input.color;"
 		" if(drawFlags.x > 0.5) color *= diffuseTexture.Sample(diffuseSampler, input.uv);"
-		" clip(color.a - 0.02);"
-		" float3 fogColor = float3(fogColorPacked & 255u,"
-		" (fogColorPacked >> 8) & 255u, (fogColorPacked >> 16) & 255u) / 255.0;"
+		" if(drawFlags.w > 1.5) clip(drawFlags.z - color.a - 0.000001);"
+		" else if(drawFlags.w > 0.5) clip(color.a - drawFlags.z);"
+		" uint packedFogColor = asuint(surfaceProps.w);"
+		" float3 fogColor = float3(packedFogColor & 255u,"
+		" (packedFogColor >> 8) & 255u, (packedFogColor >> 16) & 255u) / 255.0;"
 		" color.rgb = lerp(fogColor, color.rgb, input.fogFactor);"
 		" return color; }";
 	ID3DBlob *vertexShader = nil;
@@ -362,6 +438,7 @@ createPipelineResources(void)
 	pso.InputLayout.NumElements = (UINT)nelem(input);
 	pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
 	pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	pso.RasterizerState.FrontCounterClockwise = TRUE;
 	pso.RasterizerState.DepthClipEnable = TRUE;
 	pso.BlendState.RenderTarget[0].BlendEnable = FALSE;
 	pso.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
@@ -378,21 +455,32 @@ createPipelineResources(void)
 	pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 	pso.NumRenderTargets = 1;
 	pso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-	pso.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+	pso.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
 	pso.SampleDesc.Count = 1;
 	for(uint32 blend = 0; blend < WORLD_BLEND_COUNT && SUCCEEDED(hr); blend++){
 		pso.BlendState.RenderTarget[0].BlendEnable =
 			blend != WORLD_BLEND_OPAQUE;
-		pso.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
-		pso.BlendState.RenderTarget[0].DestBlend =
-			blend == WORLD_BLEND_ADDITIVE ? D3D12_BLEND_ONE :
-			D3D12_BLEND_INV_SRC_ALPHA;
+		getWorldPipelineBlend(blend,
+			&pso.BlendState.RenderTarget[0].SrcBlend,
+			&pso.BlendState.RenderTarget[0].DestBlend);
 		for(uint32 depth = 0; depth < WORLD_DEPTH_COUNT && SUCCEEDED(hr); depth++){
+			const bool depthTest = depth == WORLD_DEPTH_TEST_ONLY ||
+			                       depth == WORLD_DEPTH_TEST_WRITE;
+			const bool depthWrite = depth == WORLD_DEPTH_WRITE_ONLY ||
+			                        depth == WORLD_DEPTH_TEST_WRITE;
+			pso.DepthStencilState.DepthEnable = depthTest || depthWrite;
 			pso.DepthStencilState.DepthWriteMask =
-				depth == WORLD_DEPTH_WRITE ? D3D12_DEPTH_WRITE_MASK_ALL :
+				depthWrite ? D3D12_DEPTH_WRITE_MASK_ALL :
 				D3D12_DEPTH_WRITE_MASK_ZERO;
-			hr = device->CreateGraphicsPipelineState(
-				&pso, IID_PPV_ARGS(&worldPipelines[blend][depth]));
+			pso.DepthStencilState.DepthFunc = depthTest ?
+				D3D12_COMPARISON_FUNC_LESS_EQUAL : D3D12_COMPARISON_FUNC_ALWAYS;
+			for(uint32 cull = 0; cull < WORLD_CULL_COUNT && SUCCEEDED(hr); cull++){
+				pso.RasterizerState.CullMode = cull == WORLD_CULL_BACK ?
+					D3D12_CULL_MODE_BACK : cull == WORLD_CULL_FRONT ?
+					D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_NONE;
+				hr = device->CreateGraphicsPipelineState(
+					&pso, IID_PPV_ARGS(&worldPipelines[blend][depth][cull]));
+			}
 		}
 	}
 	releaseCom(vertexShader);
@@ -400,7 +488,8 @@ createPipelineResources(void)
 	if(FAILED(hr)){
 		for(uint32 blend = 0; blend < WORLD_BLEND_COUNT; blend++)
 			for(uint32 depth = 0; depth < WORLD_DEPTH_COUNT; depth++)
-				releaseCom(worldPipelines[blend][depth]);
+				for(uint32 cull = 0; cull < WORLD_CULL_COUNT; cull++)
+					releaseCom(worldPipelines[blend][depth][cull]);
 		return 0;
 	}
 	tracePipeline("pipeline PSO ready");
@@ -773,7 +862,7 @@ renderGeometry(Atomic *atomic, MeshSelection selection, uint8 fadeAlpha)
 	list->IASetVertexBuffers(0, 1, &header->vertexView);
 	list->IASetIndexBuffer(&header->indexView);
 
-	float constants[59];
+	float constants[58];
 	memset(constants, 0, sizeof(constants));
 	fillMatrix(constants, atomic->getFrame()->getLTM());
 	memcpy(constants + 16, &camera->devView, 16*sizeof(float));
@@ -783,6 +872,8 @@ renderGeometry(Atomic *atomic, MeshSelection selection, uint8 fadeAlpha)
 	if(!uploadSkinMatrices(atomic, &boneAddress, &isSkinned))
 		return 0;
 	constants[53] = isSkinned ? 1.0f : 0.0f;
+	constants[54] = (uint32)(uintptr_t)getRenderState(ALPHATESTREF)/255.0f;
+	constants[55] = (float)(uint32)(uintptr_t)getRenderState(ALPHATESTFUNC);
 	// World atomics are submitted from the renderer's fog-enabled passes, but
 	// later compatibility draws can change the global RW state. Use the camera
 	// range directly here so the modern backend cannot inherit a stale FALSE.
@@ -791,7 +882,6 @@ renderGeometry(Atomic *atomic, MeshSelection selection, uint8 fadeAlpha)
 		constants[57] = 1.0f/(camera->fogPlane - camera->farPlane);
 	}
 	uint32 packedFog = (uint32)(uintptr_t)getRenderState(FOGCOLOR);
-	memcpy(&constants[58], &packedFog, sizeof(packedFog));
 	static bool32 tracedFogParameters;
 	if(!tracedFogParameters){
 		char message[192];
@@ -817,11 +907,17 @@ renderGeometry(Atomic *atomic, MeshSelection selection, uint8 fadeAlpha)
 		constants[50] = color.blue/255.0f;
 		constants[51] = color.alpha/255.0f;
 		D3D12_GPU_DESCRIPTOR_HANDLE texture = fallback;
+		D3D12_GPU_DESCRIPTOR_HANDLE sampler;
+		getSamplerView(Texture::LINEAR, Texture::WRAP, Texture::WRAP, &sampler);
 		bool32 textured = 0;
 		bool32 textureAlpha = 0;
-		if(material && material->texture && material->texture->raster)
+		if(material && material->texture && material->texture->raster){
 			textured = getTextureView(material->texture->raster,
 			                          &texture, &textureAlpha);
+			getSamplerView(material->texture->getFilter(),
+			               material->texture->getAddressU(),
+			               material->texture->getAddressV(), &sampler);
+		}
 		bool32 transparent = fadeAlpha != 0xFF ||
 			header->meshes[i].vertexAlpha || color.alpha != 0xFF ||
 			(textured && textureAlpha);
@@ -841,22 +937,27 @@ renderGeometry(Atomic *atomic, MeshSelection selection, uint8 fadeAlpha)
 			lighting.surface[2] = 1.0f;
 			lighting.surface[3] = 0.0f;
 		}
+		memcpy(&lighting.surface[3], &packedFog, sizeof(packedFog));
 		D3D12_GPU_VIRTUAL_ADDRESS lightingAddress;
 		if(!allocateLightingConstants(&lighting, &lightingAddress))
 			return hasTransparent;
 		list->SetGraphicsRootConstantBufferView(3, lightingAddress);
 		uint32 blend = WORLD_BLEND_OPAQUE;
-		if(transparent){
-			uint32 destination = (uint32)(uintptr_t)getRenderState(DESTBLEND);
-			blend = destination == BLENDONE ?
-				WORLD_BLEND_ADDITIVE : WORLD_BLEND_ALPHA;
-		}
-		uint32 depth = getRenderState(ZWRITEENABLE) != nil ?
-			WORLD_DEPTH_WRITE : WORLD_DEPTH_NO_WRITE;
-		list->SetPipelineState(worldPipelines[blend][depth]);
+		if(transparent)
+			blend = getWorldBlendMode();
+		const bool depthTest = getRenderState(ZTESTENABLE) != nil;
+		const bool depthWrite = getRenderState(ZWRITEENABLE) != nil;
+		uint32 depth = depthTest ?
+			(depthWrite ? WORLD_DEPTH_TEST_WRITE : WORLD_DEPTH_TEST_ONLY) :
+			(depthWrite ? WORLD_DEPTH_WRITE_ONLY : WORLD_DEPTH_DISABLED);
+		uint32 cullState = (uint32)(uintptr_t)getRenderState(CULLMODE);
+		uint32 cull = cullState == CULLBACK ? WORLD_CULL_BACK :
+			cullState == CULLFRONT ? WORLD_CULL_FRONT : WORLD_CULL_NONE;
+		list->SetPipelineState(worldPipelines[blend][depth][cull]);
 		constants[52] = textured ? 1.0f : 0.0f;
-		list->SetGraphicsRoot32BitConstants(0, 59, constants, 0);
+		list->SetGraphicsRoot32BitConstants(0, 58, constants, 0);
 		list->SetGraphicsRootDescriptorTable(1, texture);
+		list->SetGraphicsRootDescriptorTable(4, sampler);
 		list->DrawIndexedInstanced(header->meshes[i].numIndices, 1,
 		                           header->meshes[i].startIndex, 0, 0);
 	}
@@ -934,7 +1035,8 @@ shutdownDefaultPipeline(void)
 	activeBoneArena = UINT32_MAX;
 	for(uint32 blend = 0; blend < WORLD_BLEND_COUNT; blend++)
 		for(uint32 depth = 0; depth < WORLD_DEPTH_COUNT; depth++)
-			releaseCom(worldPipelines[blend][depth]);
+			for(uint32 cull = 0; cull < WORLD_CULL_COUNT; cull++)
+				releaseCom(worldPipelines[blend][depth][cull]);
 	releaseCom(rootSignature);
 #endif
 }

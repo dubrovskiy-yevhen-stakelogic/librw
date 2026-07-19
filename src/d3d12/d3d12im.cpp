@@ -69,14 +69,21 @@ enum {
 	DEPTH_COMPARE_LESS,
 	DEPTH_COMPARE_COUNT
 };
+enum {
+	STENCIL_DISABLED,
+	STENCIL_ALWAYS_REPLACE,
+	STENCIL_EQUAL_KEEP,
+	STENCIL_NOT_EQUAL_KEEP,
+	STENCIL_MODE_COUNT
+};
 
-static ID3D12PipelineState *im2DPipelines[BLEND_MODE_COUNT][DEPTH_COMPARE_COUNT][DEPTH_MODE_COUNT][PIPELINE_TOPOLOGY_COUNT];
+static ID3D12PipelineState *im2DPipelines[BLEND_MODE_COUNT][DEPTH_COMPARE_COUNT][DEPTH_MODE_COUNT][STENCIL_MODE_COUNT][PIPELINE_TOPOLOGY_COUNT];
 static ID3D12RootSignature *screenDropletRootSignature;
 static ID3D12PipelineState *screenDropletPipeline;
 static ID3D12RootSignature *postFXRootSignature;
 static ID3D12PipelineState *postFXPipeline;
 static ID3D12RootSignature *im3DRootSignature;
-static ID3D12PipelineState *im3DPipelines[BLEND_MODE_COUNT][DEPTH_MODE_COUNT][PIPELINE_TOPOLOGY_COUNT];
+static ID3D12PipelineState *im3DPipelines[BLEND_MODE_COUNT][DEPTH_MODE_COUNT][STENCIL_MODE_COUNT][PIPELINE_TOPOLOGY_COUNT];
 static Raster *immediateWhiteRaster;
 static ImmediateArena arenas[IMMEDIATE_FRAME_COUNT];
 static uint32 activeArena = UINT32_MAX;
@@ -191,12 +198,74 @@ getActiveBlendMode(void)
 }
 
 static bool32
+getActiveSampler(Texture::Addressing fallbackAddress,
+                 D3D12_GPU_DESCRIPTOR_HANDLE *sampler)
+{
+	uint32 filter = (uint32)(uintptr_t)renderStates[TEXTUREFILTER];
+	uint32 address = (uint32)(uintptr_t)renderStates[TEXTUREADDRESS];
+	uint32 addressU = (uint32)(uintptr_t)renderStates[TEXTUREADDRESSU];
+	uint32 addressV = (uint32)(uintptr_t)renderStates[TEXTUREADDRESSV];
+	if(filter == 0)
+		filter = Texture::LINEAR;
+	if(address == 0)
+		address = fallbackAddress;
+	if(addressU == 0)
+		addressU = address;
+	if(addressV == 0)
+		addressV = address;
+	return getSamplerView(filter, addressU, addressV, sampler);
+}
+
+static uint32
+getActiveStencilMode(void)
+{
+	if(renderStates[STENCILENABLE] == nil)
+		return STENCIL_DISABLED;
+	uint32 function = (uint32)(uintptr_t)renderStates[STENCILFUNCTION];
+	uint32 pass = (uint32)(uintptr_t)renderStates[STENCILPASS];
+	if(function == STENCILALWAYS && pass == STENCILREPLACE)
+		return STENCIL_ALWAYS_REPLACE;
+	if(function == STENCILEQUAL)
+		return STENCIL_EQUAL_KEEP;
+	if(function == STENCILNOTEQUAL)
+		return STENCIL_NOT_EQUAL_KEEP;
+	return STENCIL_DISABLED;
+}
+
+static void
+setPipelineStencil(D3D12_DEPTH_STENCIL_DESC *state, uint32 mode)
+{
+	state->StencilEnable = mode != STENCIL_DISABLED;
+	state->StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+	state->StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+	D3D12_DEPTH_STENCILOP_DESC face;
+	memset(&face, 0, sizeof(face));
+	face.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+	face.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+	face.StencilPassOp = mode == STENCIL_ALWAYS_REPLACE ?
+		D3D12_STENCIL_OP_REPLACE : D3D12_STENCIL_OP_KEEP;
+	switch(mode){
+	case STENCIL_EQUAL_KEEP:
+		face.StencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
+		break;
+	case STENCIL_NOT_EQUAL_KEEP:
+		face.StencilFunc = D3D12_COMPARISON_FUNC_NOT_EQUAL;
+		break;
+	default:
+		face.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+		break;
+	}
+	state->FrontFace = face;
+	state->BackFace = face;
+}
+
+static bool32
 createPipeline(ID3D12Device *device, D3D12_PRIMITIVE_TOPOLOGY_TYPE type,
 	           const D3D12_SHADER_BYTECODE &vs,
 	           const D3D12_SHADER_BYTECODE &ps,
 	           const D3D12_INPUT_LAYOUT_DESC &input,
 	           uint32 blendMode, bool32 depthTest, bool32 depthWrite,
-	           bool32 strictDepth,
+	           bool32 strictDepth, uint32 stencilMode,
 	           ID3D12PipelineState **pipeline)
 {
 	D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
@@ -223,11 +292,12 @@ createPipeline(ID3D12Device *device, D3D12_PRIMITIVE_TOPOLOGY_TYPE type,
 	desc.DepthStencilState.DepthFunc = depthTest ?
 		(strictDepth ? D3D12_COMPARISON_FUNC_LESS :
 		 D3D12_COMPARISON_FUNC_LESS_EQUAL) : D3D12_COMPARISON_FUNC_ALWAYS;
+	setPipelineStencil(&desc.DepthStencilState, stencilMode);
 	desc.SampleMask = UINT_MAX;
 	desc.PrimitiveTopologyType = type;
 	desc.NumRenderTargets = 1;
 	desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-	desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+	desc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
 	desc.SampleDesc.Count = 1;
 	return SUCCEEDED(device->CreateGraphicsPipelineState(
 		&desc, IID_PPV_ARGS(pipeline)));
@@ -240,6 +310,7 @@ createIm3DPipeline(ID3D12Device *device,
 	               const D3D12_SHADER_BYTECODE &ps,
 	               const D3D12_INPUT_LAYOUT_DESC &input,
 	               uint32 blendMode, bool32 depthTest, bool32 depthWrite,
+	               uint32 stencilMode,
 	               ID3D12PipelineState **pipeline)
 {
 	D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
@@ -265,11 +336,12 @@ createIm3DPipeline(ID3D12Device *device,
 		D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
 	desc.DepthStencilState.DepthFunc = depthTest ?
 		D3D12_COMPARISON_FUNC_LESS_EQUAL : D3D12_COMPARISON_FUNC_ALWAYS;
+	setPipelineStencil(&desc.DepthStencilState, stencilMode);
 	desc.SampleMask = UINT_MAX;
 	desc.PrimitiveTopologyType = type;
 	desc.NumRenderTargets = 1;
 	desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-	desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+	desc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
 	desc.SampleDesc.Count = 1;
 	return SUCCEEDED(device->CreateGraphicsPipelineState(
 		&desc, IID_PPV_ARGS(pipeline)));
@@ -403,7 +475,7 @@ createScreenDropletResources(ID3D12Device *device)
 	desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 	desc.NumRenderTargets = 1;
 	desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-	desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+	desc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
 	desc.SampleDesc.Count = 1;
 	hr = device->CreateGraphicsPipelineState(
 		&desc, IID_PPV_ARGS(&screenDropletPipeline));
@@ -527,7 +599,7 @@ createPostFXResources(ID3D12Device *device)
 	desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 	desc.NumRenderTargets = 1;
 	desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-	desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+	desc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
 	desc.SampleDesc.Count = 1;
 	hr = device->CreateGraphicsPipelineState(
 		&desc, IID_PPV_ARGS(&postFXPipeline));
@@ -545,14 +617,19 @@ initializeImmediate(void)
 	if(device == nil)
 		return 0;
 
-	D3D12_DESCRIPTOR_RANGE range;
-	memset(&range, 0, sizeof(range));
-	range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-	range.NumDescriptors = 1;
-	range.BaseShaderRegister = 0;
-	range.OffsetInDescriptorsFromTableStart =
+	D3D12_DESCRIPTOR_RANGE ranges[2];
+	memset(ranges, 0, sizeof(ranges));
+	ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	ranges[0].NumDescriptors = 1;
+	ranges[0].BaseShaderRegister = 0;
+	ranges[0].OffsetInDescriptorsFromTableStart =
 		D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-	D3D12_ROOT_PARAMETER params[2];
+	ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+	ranges[1].NumDescriptors = 1;
+	ranges[1].BaseShaderRegister = 0;
+	ranges[1].OffsetInDescriptorsFromTableStart =
+		D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+	D3D12_ROOT_PARAMETER params[3];
 	memset(params, 0, sizeof(params));
 	params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 	params[0].Constants.ShaderRegister = 0;
@@ -560,22 +637,16 @@ initializeImmediate(void)
 	params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 	params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 	params[1].DescriptorTable.NumDescriptorRanges = 1;
-	params[1].DescriptorTable.pDescriptorRanges = &range;
+	params[1].DescriptorTable.pDescriptorRanges = &ranges[0];
 	params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-	D3D12_STATIC_SAMPLER_DESC sampler;
-	memset(&sampler, 0, sizeof(sampler));
-	sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-	sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-	sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-	sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-	sampler.MaxLOD = D3D12_FLOAT32_MAX;
-	sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	params[2].DescriptorTable.NumDescriptorRanges = 1;
+	params[2].DescriptorTable.pDescriptorRanges = &ranges[1];
+	params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 	D3D12_ROOT_SIGNATURE_DESC signature;
 	memset(&signature, 0, sizeof(signature));
-	signature.NumParameters = 2;
+	signature.NumParameters = 3;
 	signature.pParameters = params;
-	signature.NumStaticSamplers = 1;
-	signature.pStaticSamplers = &sampler;
 	signature.Flags =
 		D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 	ID3DBlob *serialized = nil;
@@ -647,15 +718,16 @@ initializeImmediate(void)
 	for(uint32 blend = 0; blend < BLEND_MODE_COUNT; blend++)
 		for(uint32 compare = 0; compare < DEPTH_COMPARE_COUNT; compare++)
 			for(uint32 depth = 0; depth < DEPTH_MODE_COUNT; depth++)
-				for(uint32 topology = 0; topology < PIPELINE_TOPOLOGY_COUNT; topology++){
-				bool32 depthTest = depth == DEPTH_TEST_ONLY || depth == DEPTH_TEST_WRITE;
-				bool32 depthWrite = depth == DEPTH_TEST_WRITE || depth == DEPTH_WRITE_ONLY;
-				pipelinesReady = pipelinesReady && createPipeline(
-					device, topologyTypes[topology], vs, ps, input,
-					blend, depthTest, depthWrite,
-					compare == DEPTH_COMPARE_LESS,
-					&im2DPipelines[blend][compare][depth][topology]);
-				}
+				for(uint32 stencil = 0; stencil < STENCIL_MODE_COUNT; stencil++)
+					for(uint32 topology = 0; topology < PIPELINE_TOPOLOGY_COUNT; topology++){
+						bool32 depthTest = depth == DEPTH_TEST_ONLY || depth == DEPTH_TEST_WRITE;
+						bool32 depthWrite = depth == DEPTH_TEST_WRITE || depth == DEPTH_WRITE_ONLY;
+						pipelinesReady = pipelinesReady && createPipeline(
+							device, topologyTypes[topology], vs, ps, input,
+							blend, depthTest, depthWrite,
+							compare == DEPTH_COMPARE_LESS, stencil,
+							&im2DPipelines[blend][compare][depth][stencil][topology]);
+					}
 	releaseCom(vertexShader);
 	releaseCom(pixelShader);
 	if(!pipelinesReady){
@@ -671,7 +743,7 @@ initializeImmediate(void)
 		return 0;
 	}
 
-	D3D12_ROOT_PARAMETER im3DParams[2];
+	D3D12_ROOT_PARAMETER im3DParams[3];
 	memset(im3DParams, 0, sizeof(im3DParams));
 	im3DParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 	im3DParams[0].Constants.ShaderRegister = 0;
@@ -679,18 +751,14 @@ initializeImmediate(void)
 	im3DParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 	im3DParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 	im3DParams[1].DescriptorTable.NumDescriptorRanges = 1;
-	im3DParams[1].DescriptorTable.pDescriptorRanges = &range;
+	im3DParams[1].DescriptorTable.pDescriptorRanges = &ranges[0];
 	im3DParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	im3DParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	im3DParams[2].DescriptorTable.NumDescriptorRanges = 1;
+	im3DParams[2].DescriptorTable.pDescriptorRanges = &ranges[1];
+	im3DParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 	D3D12_ROOT_SIGNATURE_DESC im3DSignature = signature;
 	im3DSignature.pParameters = im3DParams;
-	// RenderWare's immediate 3D effects (notably raindrop4) deliberately use
-	// UVs outside 0..1 to tile their textures. Keep Im2D clamped, but preserve
-	// the legacy wrapping behaviour for Im3D.
-	D3D12_STATIC_SAMPLER_DESC im3DSampler = sampler;
-	im3DSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-	im3DSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-	im3DSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-	im3DSignature.pStaticSamplers = &im3DSampler;
 	hr = D3D12SerializeRootSignature(
 		&im3DSignature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors);
 	if(FAILED(hr)){
@@ -765,14 +833,15 @@ initializeImmediate(void)
 	pipelinesReady = 1;
 	for(uint32 blend = 0; blend < BLEND_MODE_COUNT; blend++)
 		for(uint32 depth = 0; depth < DEPTH_MODE_COUNT; depth++)
-			for(uint32 topology = 0; topology < PIPELINE_TOPOLOGY_COUNT; topology++){
-				bool32 depthTest = depth == DEPTH_TEST_ONLY || depth == DEPTH_TEST_WRITE;
-				bool32 depthWrite = depth == DEPTH_TEST_WRITE || depth == DEPTH_WRITE_ONLY;
-				pipelinesReady = pipelinesReady && createIm3DPipeline(
-					device, topologyTypes[topology], vs, ps, im3DInput,
-					blend, depthTest, depthWrite,
-					&im3DPipelines[blend][depth][topology]);
-			}
+			for(uint32 stencil = 0; stencil < STENCIL_MODE_COUNT; stencil++)
+				for(uint32 topology = 0; topology < PIPELINE_TOPOLOGY_COUNT; topology++){
+					bool32 depthTest = depth == DEPTH_TEST_ONLY || depth == DEPTH_TEST_WRITE;
+					bool32 depthWrite = depth == DEPTH_TEST_WRITE || depth == DEPTH_WRITE_ONLY;
+					pipelinesReady = pipelinesReady && createIm3DPipeline(
+						device, topologyTypes[topology], vs, ps, im3DInput,
+						blend, depthTest, depthWrite, stencil,
+						&im3DPipelines[blend][depth][stencil][topology]);
+				}
 	releaseCom(vertexShader);
 	releaseCom(pixelShader);
 	if(!pipelinesReady){
@@ -816,8 +885,18 @@ initializeImmediate(void)
 	renderStates[ZTESTENABLE] = (void*)1;
 	renderStates[ZWRITEENABLE] = (void*)1;
 	renderStates[VERTEXALPHA] = (void*)1;
+	renderStates[TEXTUREFILTER] = (void*)Texture::LINEAR;
+	renderStates[TEXTUREADDRESS] = (void*)Texture::WRAP;
+	renderStates[TEXTUREADDRESSU] = (void*)Texture::WRAP;
+	renderStates[TEXTUREADDRESSV] = (void*)Texture::WRAP;
 	renderStates[SRCBLEND] = (void*)BLENDSRCALPHA;
 	renderStates[DESTBLEND] = (void*)BLENDINVSRCALPHA;
+	renderStates[STENCILFAIL] = (void*)STENCILKEEP;
+	renderStates[STENCILZFAIL] = (void*)STENCILKEEP;
+	renderStates[STENCILPASS] = (void*)STENCILKEEP;
+	renderStates[STENCILFUNCTION] = (void*)STENCILALWAYS;
+	renderStates[STENCILFUNCTIONMASK] = (void*)0xFF;
+	renderStates[STENCILFUNCTIONWRITEMASK] = (void*)0xFF;
 	activeArena = UINT32_MAX;
 	immediateReady = 1;
 	return 1;
@@ -842,8 +921,9 @@ shutdownImmediate(void)
 	for(uint32 blend = 0; blend < BLEND_MODE_COUNT; blend++)
 		for(uint32 compare = 0; compare < DEPTH_COMPARE_COUNT; compare++)
 			for(uint32 depth = 0; depth < DEPTH_MODE_COUNT; depth++)
-				for(uint32 topology = 0; topology < PIPELINE_TOPOLOGY_COUNT; topology++)
-					releaseCom(im2DPipelines[blend][compare][depth][topology]);
+				for(uint32 stencil = 0; stencil < STENCIL_MODE_COUNT; stencil++)
+					for(uint32 topology = 0; topology < PIPELINE_TOPOLOGY_COUNT; topology++)
+						releaseCom(im2DPipelines[blend][compare][depth][stencil][topology]);
 	releaseCom(immediateRootSignature);
 	releaseCom(screenDropletPipeline);
 	releaseCom(screenDropletRootSignature);
@@ -851,8 +931,9 @@ shutdownImmediate(void)
 	releaseCom(postFXRootSignature);
 	for(uint32 blend = 0; blend < BLEND_MODE_COUNT; blend++)
 		for(uint32 depth = 0; depth < DEPTH_MODE_COUNT; depth++)
-			for(uint32 topology = 0; topology < PIPELINE_TOPOLOGY_COUNT; topology++)
-				releaseCom(im3DPipelines[blend][depth][topology]);
+			for(uint32 stencil = 0; stencil < STENCIL_MODE_COUNT; stencil++)
+				for(uint32 topology = 0; topology < PIPELINE_TOPOLOGY_COUNT; topology++)
+					releaseCom(im3DPipelines[blend][depth][stencil][topology]);
 	releaseCom(im3DRootSignature);
 	memset(&im3DVertexView, 0, sizeof(im3DVertexView));
 	num3DVertices = 0;
@@ -861,8 +942,13 @@ shutdownImmediate(void)
 void
 setRenderState(int32 state, void *value)
 {
-	if(state >= 0 && state < RENDER_STATE_COUNT)
+	if(state >= 0 && state < RENDER_STATE_COUNT){
 		renderStates[state] = value;
+		if(state == TEXTUREADDRESS){
+			renderStates[TEXTUREADDRESSU] = value;
+			renderStates[TEXTUREADDRESSV] = value;
+		}
+	}
 }
 
 void
@@ -941,22 +1027,23 @@ selectPipeline(PrimitiveType type, D3D12_PRIMITIVE_TOPOLOGY *topology)
 	uint32 depth = depthTest ?
 		(depthWrite ? DEPTH_TEST_WRITE : DEPTH_TEST_ONLY) :
 		(depthWrite ? DEPTH_WRITE_ONLY : DEPTH_DISABLED);
+	uint32 stencil = getActiveStencilMode();
 	switch(type){
 	case PRIMTYPELINELIST:
 		*topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
-		return im2DPipelines[blend][compare][depth][PIPELINE_LINE];
+		return im2DPipelines[blend][compare][depth][stencil][PIPELINE_LINE];
 	case PRIMTYPEPOLYLINE:
 		*topology = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
-		return im2DPipelines[blend][compare][depth][PIPELINE_LINE];
+		return im2DPipelines[blend][compare][depth][stencil][PIPELINE_LINE];
 	case PRIMTYPEPOINTLIST:
 		*topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
-		return im2DPipelines[blend][compare][depth][PIPELINE_POINT];
+		return im2DPipelines[blend][compare][depth][stencil][PIPELINE_POINT];
 	case PRIMTYPETRISTRIP:
 		*topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
-		return im2DPipelines[blend][compare][depth][PIPELINE_TRIANGLE];
+		return im2DPipelines[blend][compare][depth][stencil][PIPELINE_TRIANGLE];
 	default:
 		*topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-		return im2DPipelines[blend][compare][depth][PIPELINE_TRIANGLE];
+		return im2DPipelines[blend][compare][depth][stencil][PIPELINE_TRIANGLE];
 	}
 }
 
@@ -999,6 +1086,7 @@ drawImmediate(PrimitiveType type, Im2DVertex *vertices, int32 numVertices,
 	ID3D12PipelineState *pipeline = selectPipeline(type, &topology);
 	list->SetGraphicsRootSignature(immediateRootSignature);
 	list->SetPipelineState(pipeline);
+	list->OMSetStencilRef((UINT)(uintptr_t)renderStates[STENCILFUNCTIONREF] & 0xFFu);
 	list->IASetPrimitiveTopology(topology);
 	list->IASetVertexBuffers(0, 1, &vertexView);
 	if(indices)
@@ -1013,7 +1101,13 @@ drawImmediate(PrimitiveType type, Im2DVertex *vertices, int32 numVertices,
 	D3D12_GPU_DESCRIPTOR_HANDLE texture;
 	if(!getTextureView(raster, &texture, nil))
 		getTextureView(immediateWhiteRaster, &texture, nil);
+	D3D12_GPU_DESCRIPTOR_HANDLE sampler;
+	if(!getActiveSampler(Texture::CLAMP, &sampler)){
+		rwFree(fanIndices);
+		return;
+	}
 	list->SetGraphicsRootDescriptorTable(1, texture);
+	list->SetGraphicsRootDescriptorTable(2, sampler);
 	if(indices)
 		list->DrawIndexedInstanced(numIndices, 1, 0, 0, 0);
 	else
@@ -1205,22 +1299,23 @@ selectIm3DPipeline(PrimitiveType type,
 	uint32 depth = depthTest ?
 		(depthWrite ? DEPTH_TEST_WRITE : DEPTH_TEST_ONLY) :
 		(depthWrite ? DEPTH_WRITE_ONLY : DEPTH_DISABLED);
+	uint32 stencil = getActiveStencilMode();
 	switch(type){
 	case PRIMTYPELINELIST:
 		*topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
-		return im3DPipelines[blend][depth][PIPELINE_LINE];
+		return im3DPipelines[blend][depth][stencil][PIPELINE_LINE];
 	case PRIMTYPEPOLYLINE:
 		*topology = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
-		return im3DPipelines[blend][depth][PIPELINE_LINE];
+		return im3DPipelines[blend][depth][stencil][PIPELINE_LINE];
 	case PRIMTYPEPOINTLIST:
 		*topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
-		return im3DPipelines[blend][depth][PIPELINE_POINT];
+		return im3DPipelines[blend][depth][stencil][PIPELINE_POINT];
 	case PRIMTYPETRISTRIP:
 		*topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
-		return im3DPipelines[blend][depth][PIPELINE_TRIANGLE];
+		return im3DPipelines[blend][depth][stencil][PIPELINE_TRIANGLE];
 	default:
 		*topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-		return im3DPipelines[blend][depth][PIPELINE_TRIANGLE];
+		return im3DPipelines[blend][depth][stencil][PIPELINE_TRIANGLE];
 	}
 }
 
@@ -1265,6 +1360,7 @@ drawIm3D(PrimitiveType type, uint16 *indices, int32 numIndices)
 	ID3D12PipelineState *pipeline = selectIm3DPipeline(type, &topology);
 	list->SetGraphicsRootSignature(im3DRootSignature);
 	list->SetPipelineState(pipeline);
+	list->OMSetStencilRef((UINT)(uintptr_t)renderStates[STENCILFUNCTIONREF] & 0xFFu);
 	list->IASetPrimitiveTopology(topology);
 	list->IASetVertexBuffers(0, 1, &im3DVertexView);
 	if(indices)
@@ -1280,6 +1376,11 @@ drawIm3D(PrimitiveType type, uint16 *indices, int32 numIndices)
 		getTextureView(raster, &texture, nil);
 	if(!textured)
 		getTextureView(immediateWhiteRaster, &texture, nil);
+	D3D12_GPU_DESCRIPTOR_HANDLE sampler;
+	if(!getActiveSampler(Texture::WRAP, &sampler)){
+		rwFree(fanIndices);
+		return;
+	}
 	constants[48] = textured ? 1.0f : 0.0f;
 	if(getRenderState(FOGENABLE) != nil &&
 	   camera->fogPlane < camera->farPlane){
@@ -1290,6 +1391,7 @@ drawIm3D(PrimitiveType type, uint16 *indices, int32 numIndices)
 	memcpy(&constants[54], &packedFog, sizeof(packedFog));
 	list->SetGraphicsRoot32BitConstants(0, 55, constants, 0);
 	list->SetGraphicsRootDescriptorTable(1, texture);
+	list->SetGraphicsRootDescriptorTable(2, sampler);
 	if(indices)
 		list->DrawIndexedInstanced(numIndices, 1, 0, 0, 0);
 	else

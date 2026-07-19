@@ -16,12 +16,15 @@ ID3D12Device *getDevice(void);
 ID3D12CommandQueue *getCommandQueue(void);
 ID3D12GraphicsCommandList *getCommandList(void);
 ID3D12DescriptorHeap *getShaderResourceHeap(void);
+ID3D12DescriptorHeap *getSamplerHeap(void);
 uint32 getFrameIndex(void);
 void getPresentSize(int32 *width, int32 *height);
 void deferRelease(IUnknown *object);
 
 bool32 allocateShaderResourceDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE *cpu,
                                         D3D12_GPU_DESCRIPTOR_HANDLE *gpu);
+bool32 getSamplerView(uint32 filter, uint32 addressU, uint32 addressV,
+                      D3D12_GPU_DESCRIPTOR_HANDLE *gpu);
 bool32 allocateDepthDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE *cpu);
 bool32 allocateRenderTargetDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE *cpu);
 
