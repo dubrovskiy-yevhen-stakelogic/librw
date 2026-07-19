@@ -73,6 +73,8 @@ enum {
 static ID3D12PipelineState *im2DPipelines[BLEND_MODE_COUNT][DEPTH_COMPARE_COUNT][DEPTH_MODE_COUNT][PIPELINE_TOPOLOGY_COUNT];
 static ID3D12RootSignature *screenDropletRootSignature;
 static ID3D12PipelineState *screenDropletPipeline;
+static ID3D12RootSignature *postFXRootSignature;
+static ID3D12PipelineState *postFXPipeline;
 static ID3D12RootSignature *im3DRootSignature;
 static ID3D12PipelineState *im3DPipelines[BLEND_MODE_COUNT][DEPTH_MODE_COUNT][PIPELINE_TOPOLOGY_COUNT];
 static Raster *immediateWhiteRaster;
@@ -410,6 +412,130 @@ createScreenDropletResources(ID3D12Device *device)
 	return SUCCEEDED(hr);
 }
 
+static bool32
+createPostFXResources(ID3D12Device *device)
+{
+	D3D12_DESCRIPTOR_RANGE range;
+	memset(&range, 0, sizeof(range));
+	range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	range.NumDescriptors = 1;
+	range.BaseShaderRegister = 0;
+	range.OffsetInDescriptorsFromTableStart =
+		D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+	D3D12_ROOT_PARAMETER params[2];
+	memset(params, 0, sizeof(params));
+	params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+	params[0].Constants.ShaderRegister = 0;
+	params[0].Constants.Num32BitValues = 12;
+	params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+	params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	params[1].DescriptorTable.NumDescriptorRanges = 1;
+	params[1].DescriptorTable.pDescriptorRanges = &range;
+	params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	D3D12_STATIC_SAMPLER_DESC sampler;
+	memset(&sampler, 0, sizeof(sampler));
+	sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+	sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	sampler.MaxLOD = D3D12_FLOAT32_MAX;
+	sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	D3D12_ROOT_SIGNATURE_DESC signature;
+	memset(&signature, 0, sizeof(signature));
+	signature.NumParameters = 2;
+	signature.pParameters = params;
+	signature.NumStaticSamplers = 1;
+	signature.pStaticSamplers = &sampler;
+	signature.Flags =
+		D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+	ID3DBlob *serialized = nil;
+	ID3DBlob *errors = nil;
+	HRESULT hr = D3D12SerializeRootSignature(
+		&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors);
+	if(FAILED(hr)){
+		if(errors)
+			fprintf(stderr, "librw D3D12 post FX root signature: %s\n",
+			        (const char*)errors->GetBufferPointer());
+		releaseCom(errors);
+		releaseCom(serialized);
+		return 0;
+	}
+	releaseCom(errors);
+	hr = device->CreateRootSignature(
+		0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+		IID_PPV_ARGS(&postFXRootSignature));
+	releaseCom(serialized);
+	if(FAILED(hr))
+		return 0;
+
+	static const char *shaderSource =
+		"cbuffer PostFXConstants : register(b0) { float2 screenSize;"
+		" uint effectMode; float unusedValue; float4 effect0; float4 effect1; };"
+		"Texture2D image : register(t0); SamplerState imageSampler : register(s0);"
+		"struct VSIn { float4 position : POSITION; uint color : COLOR0;"
+		" float2 uv : TEXCOORD0; };"
+		"struct VSOut { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };"
+		"VSOut VSMain(VSIn input) { VSOut output;"
+		" output.position = float4(input.position.x * 2.0 / screenSize.x - 1.0,"
+		" 1.0 - input.position.y * 2.0 / screenSize.y, input.position.z, 1.0);"
+		" output.uv = input.uv; return output; }"
+		"float4 PSMain(VSOut input) : SV_TARGET {"
+		" float4 dst = image.Sample(imageSampler, input.uv);"
+		" if(effectMode != 0) return float4(dst.rgb * effect0.rgb + effect1.rgb, 1.0);"
+		" float a = effect0.a; float4 doublec = saturate(effect0 * 2.0);"
+		" float4 previous = dst;"
+		" [unroll] for(int i = 0; i < 5; i++) {"
+		"  float4 value = dst * (1.0 - a) + previous * doublec * a;"
+		"  value += previous * effect0; value += previous * effect0;"
+		"  previous = saturate(value); }"
+		" return float4(previous.rgb, 1.0); }";
+	ID3DBlob *vertexShader = nil;
+	ID3DBlob *pixelShader = nil;
+	if(!compileShader(shaderSource, "VSMain", "vs_5_0", &vertexShader) ||
+	   !compileShader(shaderSource, "PSMain", "ps_5_0", &pixelShader)){
+		releaseCom(vertexShader);
+		releaseCom(pixelShader);
+		return 0;
+	}
+	D3D12_INPUT_ELEMENT_DESC elements[] = {
+		{ "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
+		  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+		{ "COLOR", 0, DXGI_FORMAT_R32_UINT, 0, 16,
+		  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+		{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 20,
+		  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+	};
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
+	memset(&desc, 0, sizeof(desc));
+	desc.pRootSignature = postFXRootSignature;
+	desc.VS.pShaderBytecode = vertexShader->GetBufferPointer();
+	desc.VS.BytecodeLength = vertexShader->GetBufferSize();
+	desc.PS.pShaderBytecode = pixelShader->GetBufferPointer();
+	desc.PS.BytecodeLength = pixelShader->GetBufferSize();
+	desc.InputLayout.pInputElementDescs = elements;
+	desc.InputLayout.NumElements = (UINT)nelem(elements);
+	desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+	desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	desc.RasterizerState.DepthClipEnable = TRUE;
+	desc.BlendState.RenderTarget[0].BlendEnable = FALSE;
+	desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+		D3D12_COLOR_WRITE_ENABLE_ALL;
+	desc.DepthStencilState.DepthEnable = FALSE;
+	desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+	desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+	desc.SampleMask = UINT_MAX;
+	desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	desc.NumRenderTargets = 1;
+	desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+	desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+	desc.SampleDesc.Count = 1;
+	hr = device->CreateGraphicsPipelineState(
+		&desc, IID_PPV_ARGS(&postFXPipeline));
+	releaseCom(vertexShader);
+	releaseCom(pixelShader);
+	return SUCCEEDED(hr);
+}
+
 bool32
 initializeImmediate(void)
 {
@@ -537,6 +663,10 @@ initializeImmediate(void)
 		return 0;
 	}
 	if(!createScreenDropletResources(device)){
+		shutdownImmediate();
+		return 0;
+	}
+	if(!createPostFXResources(device)){
 		shutdownImmediate();
 		return 0;
 	}
@@ -717,6 +847,8 @@ shutdownImmediate(void)
 	releaseCom(immediateRootSignature);
 	releaseCom(screenDropletPipeline);
 	releaseCom(screenDropletRootSignature);
+	releaseCom(postFXPipeline);
+	releaseCom(postFXRootSignature);
 	for(uint32 blend = 0; blend < BLEND_MODE_COUNT; blend++)
 		for(uint32 depth = 0; depth < DEPTH_MODE_COUNT; depth++)
 			for(uint32 topology = 0; topology < PIPELINE_TOPOLOGY_COUNT; topology++)
@@ -932,6 +1064,62 @@ renderScreenDroplets(void *vertices, int32 numVertices, int32 vertexStride,
 	list->SetGraphicsRoot32BitConstants(0, 2, screen, 0);
 	list->SetGraphicsRootDescriptorTable(1, maskView);
 	list->SetGraphicsRootDescriptorTable(2, sceneView);
+	list->DrawIndexedInstanced(numIndices, 1, 0, 0, 0);
+	return 1;
+}
+
+bool32
+renderPostFX(void *vertices, int32 numVertices, int32 vertexStride,
+	         void *indices, int32 numIndices, Raster *sceneRaster,
+	         uint32 effectMode, const float effect0[4], const float effect1[4])
+{
+	if(!immediateReady || postFXPipeline == nil || vertices == nil ||
+	   indices == nil || numVertices <= 0 || numIndices <= 0 ||
+	   vertexStride < (int32)sizeof(Im2DVertex) || effect0 == nil ||
+	   effect1 == nil)
+		return 0;
+	ID3D12GraphicsCommandList *list = getCommandList();
+	if(list == nil)
+		return 0;
+	D3D12_GPU_DESCRIPTOR_HANDLE sceneView;
+	if(!getTextureView(sceneRaster, &sceneView, nil))
+		return 0;
+	uint64 vertexAddress, indexAddress;
+	uint32 vertexBytes = numVertices*vertexStride;
+	uint32 indexBytes = numIndices*sizeof(uint16);
+	if(!allocateUpload(vertices, vertexBytes, &vertexAddress) ||
+	   !allocateUpload(indices, indexBytes, &indexAddress))
+		return 0;
+	D3D12_VERTEX_BUFFER_VIEW vertexView;
+	vertexView.BufferLocation = vertexAddress;
+	vertexView.SizeInBytes = vertexBytes;
+	vertexView.StrideInBytes = vertexStride;
+	D3D12_INDEX_BUFFER_VIEW indexView;
+	indexView.BufferLocation = indexAddress;
+	indexView.SizeInBytes = indexBytes;
+	indexView.Format = DXGI_FORMAT_R16_UINT;
+	list->SetGraphicsRootSignature(postFXRootSignature);
+	list->SetPipelineState(postFXPipeline);
+	list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	list->IASetVertexBuffers(0, 1, &vertexView);
+	list->IASetIndexBuffer(&indexView);
+	struct PostFXConstants {
+		float screenSize[2];
+		uint32 effectMode;
+		float unusedValue;
+		float effect0[4];
+		float effect1[4];
+	} constants;
+	int32 width, height;
+	getPresentSize(&width, &height);
+	constants.screenSize[0] = (float)(width > 0 ? width : 1);
+	constants.screenSize[1] = (float)(height > 0 ? height : 1);
+	constants.effectMode = effectMode;
+	constants.unusedValue = 0.0f;
+	memcpy(constants.effect0, effect0, sizeof(constants.effect0));
+	memcpy(constants.effect1, effect1, sizeof(constants.effect1));
+	list->SetGraphicsRoot32BitConstants(0, 12, &constants, 0);
+	list->SetGraphicsRootDescriptorTable(1, sceneView);
 	list->DrawIndexedInstanced(numIndices, 1, 0, 0, 0);
 	return 1;
 }

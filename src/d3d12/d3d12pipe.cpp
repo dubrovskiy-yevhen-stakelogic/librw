@@ -73,14 +73,25 @@ struct D3D12InstanceDataHeader : InstanceDataHeader
 };
 
 static ID3D12RootSignature *rootSignature;
-static ID3D12PipelineState *opaquePipelineState;
-static ID3D12PipelineState *alphaPipelineState;
+enum WorldBlendMode {
+	WORLD_BLEND_OPAQUE,
+	WORLD_BLEND_ALPHA,
+	WORLD_BLEND_ADDITIVE,
+	WORLD_BLEND_COUNT
+};
+enum WorldDepthMode {
+	WORLD_DEPTH_NO_WRITE,
+	WORLD_DEPTH_WRITE,
+	WORLD_DEPTH_COUNT
+};
+static ID3D12PipelineState *worldPipelines[WORLD_BLEND_COUNT][WORLD_DEPTH_COUNT];
 static Raster *whiteRaster;
 static bool32 pipelineReady;
 
 enum {
 	BONE_FRAME_COUNT = 3,
 	MAX_SKIN_BONES = 64,
+	MAX_WORLD_LIGHTS = 8,
 	BONE_UPLOAD_SIZE = 4*1024*1024
 };
 
@@ -94,9 +105,10 @@ struct BoneArena
 struct LightingConstants
 {
 	float ambient[4];
-	float direction[4];
-	float directionColor[4];
 	float surface[4];
+	float colorRadius[MAX_WORLD_LIGHTS][4];
+	float positionCos[MAX_WORLD_LIGHTS][4];
+	float directionClamp[MAX_WORLD_LIGHTS][4];
 };
 
 static BoneArena boneArenas[BONE_FRAME_COUNT];
@@ -260,7 +272,8 @@ createPipelineResources(void)
 		" float fogEnd; float fogRange; uint fogColorPacked; };"
 		"cbuffer SkinConstants : register(b1) { row_major float4x4 bones[64]; };"
 		"cbuffer LightingConstants : register(b2) { float4 ambientLight;"
-		" float4 lightDirection; float4 lightColor; float4 surfaceProps; };"
+		" float4 surfaceProps; float4 lightColorRadius[8];"
+		" float4 lightPositionCos[8]; float4 lightDirectionClamp[8]; };"
 		"Texture2D diffuseTexture : register(t0);"
 		"SamplerState diffuseSampler : register(s0);"
 		"struct VSIn { float3 position : POSITION; float3 normal : NORMAL;"
@@ -276,13 +289,34 @@ createPipelineResources(void)
 		" [unroll] for(int i = 0; i < 4; i++)"
 		" { localPosition += mul(float4(input.position, 1.0), bones[input.indices[i]]) * input.weights[i];"
 		" localNormal += mul(float4(input.normal, 0.0), bones[input.indices[i]]).xyz * input.weights[i]; } }"
-		" float4 p = mul(localPosition, world);"
-		" p = mul(p, view); output.position = mul(p, projection);"
+		" float4 worldPosition = mul(localPosition, world);"
+		" float4 p = mul(worldPosition, view); output.position = mul(p, projection);"
 		" output.fogFactor = fogRange < 0.0 ?"
 		" saturate((p.z - fogEnd) * fogRange) : 1.0;"
 		" float3 normal = normalize(mul(float4(localNormal, 0.0), world).xyz);"
 		" float3 litColor = input.color.rgb + ambientLight.rgb * surfaceProps.x;"
-		" litColor += max(0.0, dot(normal, -lightDirection.xyz)) * lightColor.rgb * surfaceProps.z;"
+		" [unroll] for(int lightIndex = 0; lightIndex < 8; lightIndex++) {"
+		"  float4 light = lightColorRadius[lightIndex]; if(light.w == 0.0) break;"
+		"  float diffuse = 0.0; float attenuation = 1.0;"
+		"  if(light.w < 0.0) {"
+		"   diffuse = max(0.0, dot(normal, -lightDirectionClamp[lightIndex].xyz));"
+		"  } else {"
+		"   float3 toVertex = worldPosition.xyz - lightPositionCos[lightIndex].xyz;"
+		"   float distanceToLight = length(toVertex);"
+		"   float3 ray = distanceToLight > 0.0001 ? toVertex / distanceToLight : float3(0.0, 0.0, 0.0);"
+		"   attenuation = max(0.0, 1.0 - distanceToLight / light.w);"
+		"   diffuse = max(0.0, dot(normal, -ray));"
+		"   float falloffClamp = lightDirectionClamp[lightIndex].w;"
+		"   if(falloffClamp >= 0.0) {"
+		"    float pointCos = dot(ray, lightDirectionClamp[lightIndex].xyz);"
+		"    float coneCos = -lightPositionCos[lightIndex].w;"
+		"    float falloff = (pointCos - coneCos) / max(0.0001, 1.0 - coneCos);"
+		"    if(falloff < 0.0) diffuse = 0.0;"
+		"    diffuse *= max(falloff, falloffClamp);"
+		"   }"
+		"  }"
+		"  litColor += diffuse * light.rgb * attenuation * surfaceProps.z;"
+		" }"
 		" output.color = float4(saturate(litColor), input.color.a) * materialColor; output.uv = input.uv;"
 		" return output; }"
 		"float4 PSMain(VSOut input) : SV_TARGET {"
@@ -346,17 +380,27 @@ createPipelineResources(void)
 	pso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
 	pso.DSVFormat = DXGI_FORMAT_D32_FLOAT;
 	pso.SampleDesc.Count = 1;
-	hr = device->CreateGraphicsPipelineState(&pso,
-	                                        IID_PPV_ARGS(&opaquePipelineState));
-	if(SUCCEEDED(hr)){
-		pso.BlendState.RenderTarget[0].BlendEnable = TRUE;
-		hr = device->CreateGraphicsPipelineState(&pso,
-		                                        IID_PPV_ARGS(&alphaPipelineState));
+	for(uint32 blend = 0; blend < WORLD_BLEND_COUNT && SUCCEEDED(hr); blend++){
+		pso.BlendState.RenderTarget[0].BlendEnable =
+			blend != WORLD_BLEND_OPAQUE;
+		pso.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+		pso.BlendState.RenderTarget[0].DestBlend =
+			blend == WORLD_BLEND_ADDITIVE ? D3D12_BLEND_ONE :
+			D3D12_BLEND_INV_SRC_ALPHA;
+		for(uint32 depth = 0; depth < WORLD_DEPTH_COUNT && SUCCEEDED(hr); depth++){
+			pso.DepthStencilState.DepthWriteMask =
+				depth == WORLD_DEPTH_WRITE ? D3D12_DEPTH_WRITE_MASK_ALL :
+				D3D12_DEPTH_WRITE_MASK_ZERO;
+			hr = device->CreateGraphicsPipelineState(
+				&pso, IID_PPV_ARGS(&worldPipelines[blend][depth]));
+		}
 	}
 	releaseCom(vertexShader);
 	releaseCom(pixelShader);
 	if(FAILED(hr)){
-		releaseCom(opaquePipelineState);
+		for(uint32 blend = 0; blend < WORLD_BLEND_COUNT; blend++)
+			for(uint32 depth = 0; depth < WORLD_DEPTH_COUNT; depth++)
+				releaseCom(worldPipelines[blend][depth]);
 		return 0;
 	}
 	tracePipeline("pipeline PSO ready");
@@ -568,7 +612,7 @@ allocateLightingConstants(const LightingConstants *constants,
 	}
 	BoneArena &arena = boneArenas[frame];
 	uint32 offset = (arena.offset + 255u) & ~255u;
-	const uint32 size = 256;
+	const uint32 size = (sizeof(*constants) + 255u) & ~255u;
 	if(arena.mapped == nil || offset + size > BONE_UPLOAD_SIZE)
 		return 0;
 	memset(arena.mapped + offset, 0, size);
@@ -583,8 +627,6 @@ collectLighting(Atomic *atomic, LightingConstants *constants)
 {
 	memset(constants, 0, sizeof(*constants));
 	constants->ambient[3] = 1.0f;
-	constants->direction[3] = 0.0f;
-	constants->directionColor[3] = 1.0f;
 	if(atomic == nil || atomic->geometry == nil ||
 	   (atomic->geometry->flags & Geometry::LIGHT) == 0 ||
 	   engine->currentWorld == nil)
@@ -602,17 +644,47 @@ collectLighting(Atomic *atomic, LightingConstants *constants)
 	constants->ambient[0] = lightData.ambient.red;
 	constants->ambient[1] = lightData.ambient.green;
 	constants->ambient[2] = lightData.ambient.blue;
-	if((atomic->geometry->flags & Geometry::NORMALS) &&
-	   lightData.numDirectionals > 0 && lightData.directionals[0] &&
-	   lightData.directionals[0]->getFrame()){
-		Light *light = lightData.directionals[0];
+	int32 count = 0;
+	for(int32 i = 0; i < lightData.numDirectionals &&
+	    count < MAX_WORLD_LIGHTS; i++){
+		Light *light = lightData.directionals[i];
+		if(light == nil || light->getFrame() == nil)
+			continue;
 		V3d direction = light->getFrame()->getLTM()->at;
-		constants->direction[0] = direction.x;
-		constants->direction[1] = direction.y;
-		constants->direction[2] = direction.z;
-		constants->directionColor[0] = light->color.red;
-		constants->directionColor[1] = light->color.green;
-		constants->directionColor[2] = light->color.blue;
+		constants->colorRadius[count][0] = light->color.red;
+		constants->colorRadius[count][1] = light->color.green;
+		constants->colorRadius[count][2] = light->color.blue;
+		constants->colorRadius[count][3] = -1.0f;
+		constants->directionClamp[count][0] = direction.x;
+		constants->directionClamp[count][1] = direction.y;
+		constants->directionClamp[count][2] = direction.z;
+		constants->directionClamp[count][3] = -1.0f;
+		count++;
+	}
+	for(int32 i = 0; i < lightData.numLocals &&
+	    count < MAX_WORLD_LIGHTS; i++){
+		Light *light = lightData.locals[i];
+		if(light == nil || light->getFrame() == nil || light->radius <= 0.0f)
+			continue;
+		Matrix *matrix = light->getFrame()->getLTM();
+		constants->colorRadius[count][0] = light->color.red;
+		constants->colorRadius[count][1] = light->color.green;
+		constants->colorRadius[count][2] = light->color.blue;
+		constants->colorRadius[count][3] = light->radius;
+		constants->positionCos[count][0] = matrix->pos.x;
+		constants->positionCos[count][1] = matrix->pos.y;
+		constants->positionCos[count][2] = matrix->pos.z;
+		if(light->getType() == Light::POINT){
+			constants->directionClamp[count][3] = -1.0f;
+		}else{
+			constants->positionCos[count][3] = light->minusCosAngle;
+			constants->directionClamp[count][0] = matrix->at.x;
+			constants->directionClamp[count][1] = matrix->at.y;
+			constants->directionClamp[count][2] = matrix->at.z;
+			constants->directionClamp[count][3] =
+				light->getType() == Light::SOFTSPOT ? 0.0f : 1.0f;
+		}
+		count++;
 	}
 }
 
@@ -673,8 +745,14 @@ uploadSkinMatrices(Atomic *atomic, D3D12_GPU_VIRTUAL_ADDRESS *address,
 	return allocateBoneConstants(matrices, address);
 }
 
-static void
-renderGeometry(Atomic *atomic)
+enum MeshSelection {
+	MESH_ALL,
+	MESH_OPAQUE_ONLY,
+	MESH_TRANSPARENT_ONLY
+};
+
+static bool32
+renderGeometry(Atomic *atomic, MeshSelection selection, uint8 fadeAlpha)
 {
 	static bool32 tracedFirstDraw;
 	if(!tracedFirstDraw){
@@ -683,15 +761,14 @@ renderGeometry(Atomic *atomic)
 	}
 	if(!pipelineReady || atomic == nil || atomic->geometry == nil ||
 	   !instanceGeometry(atomic->geometry))
-		return;
+		return 0;
 	ID3D12GraphicsCommandList *list = getCommandList();
 	Camera *camera = engine->currentCamera;
 	if(list == nil || camera == nil || atomic->getFrame() == nil)
-		return;
+		return 0;
 	D3D12InstanceDataHeader *header =
 		(D3D12InstanceDataHeader*)atomic->geometry->instData;
 	list->SetGraphicsRootSignature(rootSignature);
-	list->SetPipelineState(opaquePipelineState);
 	list->IASetPrimitiveTopology(header->topology);
 	list->IASetVertexBuffers(0, 1, &header->vertexView);
 	list->IASetIndexBuffer(&header->indexView);
@@ -704,7 +781,7 @@ renderGeometry(Atomic *atomic)
 	D3D12_GPU_VIRTUAL_ADDRESS boneAddress;
 	bool32 isSkinned;
 	if(!uploadSkinMatrices(atomic, &boneAddress, &isSkinned))
-		return;
+		return 0;
 	constants[53] = isSkinned ? 1.0f : 0.0f;
 	// World atomics are submitted from the renderer's fog-enabled passes, but
 	// later compatibility draws can change the global RW state. Use the camera
@@ -730,13 +807,29 @@ renderGeometry(Atomic *atomic)
 	collectLighting(atomic, &lighting);
 	D3D12_GPU_DESCRIPTOR_HANDLE fallback;
 	getTextureView(whiteRaster, &fallback, nil);
+	bool32 hasTransparent = 0;
 	for(uint32 i = 0; i < header->numMeshes; i++){
 		Material *material = header->meshes[i].material;
 		RGBA color = material ? material->color : makeRGBA(255, 255, 255, 255);
+		color.alpha = (uint8)((color.alpha*fadeAlpha)/255);
 		constants[48] = color.red/255.0f;
 		constants[49] = color.green/255.0f;
 		constants[50] = color.blue/255.0f;
 		constants[51] = color.alpha/255.0f;
+		D3D12_GPU_DESCRIPTOR_HANDLE texture = fallback;
+		bool32 textured = 0;
+		bool32 textureAlpha = 0;
+		if(material && material->texture && material->texture->raster)
+			textured = getTextureView(material->texture->raster,
+			                          &texture, &textureAlpha);
+		bool32 transparent = fadeAlpha != 0xFF ||
+			header->meshes[i].vertexAlpha || color.alpha != 0xFF ||
+			(textured && textureAlpha);
+		hasTransparent = hasTransparent || transparent;
+		if(selection == MESH_OPAQUE_ONLY && transparent)
+			continue;
+		if(selection == MESH_TRANSPARENT_ONLY && !transparent)
+			continue;
 		if(material){
 			lighting.surface[0] = material->surfaceProps.ambient;
 			lighting.surface[1] = material->surfaceProps.specular;
@@ -750,24 +843,36 @@ renderGeometry(Atomic *atomic)
 		}
 		D3D12_GPU_VIRTUAL_ADDRESS lightingAddress;
 		if(!allocateLightingConstants(&lighting, &lightingAddress))
-			return;
+			return hasTransparent;
 		list->SetGraphicsRootConstantBufferView(3, lightingAddress);
-		D3D12_GPU_DESCRIPTOR_HANDLE texture = fallback;
-		bool32 textured = 0;
-		bool32 textureAlpha = 0;
-		if(material && material->texture && material->texture->raster)
-			textured = getTextureView(material->texture->raster,
-			                          &texture, &textureAlpha);
-		bool32 transparent = header->meshes[i].vertexAlpha ||
-			color.alpha != 0xFF || (textured && textureAlpha);
-		list->SetPipelineState(transparent ?
-			alphaPipelineState : opaquePipelineState);
+		uint32 blend = WORLD_BLEND_OPAQUE;
+		if(transparent){
+			uint32 destination = (uint32)(uintptr_t)getRenderState(DESTBLEND);
+			blend = destination == BLENDONE ?
+				WORLD_BLEND_ADDITIVE : WORLD_BLEND_ALPHA;
+		}
+		uint32 depth = getRenderState(ZWRITEENABLE) != nil ?
+			WORLD_DEPTH_WRITE : WORLD_DEPTH_NO_WRITE;
+		list->SetPipelineState(worldPipelines[blend][depth]);
 		constants[52] = textured ? 1.0f : 0.0f;
 		list->SetGraphicsRoot32BitConstants(0, 59, constants, 0);
 		list->SetGraphicsRootDescriptorTable(1, texture);
 		list->DrawIndexedInstanced(header->meshes[i].numIndices, 1,
 		                           header->meshes[i].startIndex, 0, 0);
 	}
+	return hasTransparent;
+}
+
+bool32
+renderAtomicFirstPass(Atomic *atomic)
+{
+	return renderGeometry(atomic, MESH_OPAQUE_ONLY, 255);
+}
+
+void
+renderAtomicBlendPass(Atomic *atomic, uint8 fadeAlpha)
+{
+	renderGeometry(atomic, MESH_TRANSPARENT_ONLY, fadeAlpha);
 }
 
 static void
@@ -787,7 +892,7 @@ pipelineUninstance(ObjPipeline*, Atomic *atomic)
 static void
 pipelineRender(ObjPipeline*, Atomic *atomic)
 {
-	renderGeometry(atomic);
+	renderGeometry(atomic, MESH_ALL, 255);
 }
 
 #else
@@ -827,8 +932,9 @@ shutdownDefaultPipeline(void)
 		releaseCom(boneArenas[i].resource);
 	}
 	activeBoneArena = UINT32_MAX;
-	releaseCom(alphaPipelineState);
-	releaseCom(opaquePipelineState);
+	for(uint32 blend = 0; blend < WORLD_BLEND_COUNT; blend++)
+		for(uint32 depth = 0; depth < WORLD_DEPTH_COUNT; depth++)
+			releaseCom(worldPipelines[blend][depth]);
 	releaseCom(rootSignature);
 #endif
 }
