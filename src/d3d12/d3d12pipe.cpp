@@ -203,7 +203,7 @@ createPipelineResources(void)
 	memset(params, 0, sizeof(params));
 	params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 	params[0].Constants.ShaderRegister = 0;
-	params[0].Constants.Num32BitValues = 56;
+	params[0].Constants.Num32BitValues = 59;
 	params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 	params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 	params[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -256,7 +256,8 @@ createPipelineResources(void)
 	static const char *shaderSource =
 		"cbuffer DrawConstants : register(b0) {"
 		" row_major float4x4 world; row_major float4x4 view;"
-		" row_major float4x4 projection; float4 materialColor; float4 drawFlags; };"
+		" row_major float4x4 projection; float4 materialColor; float4 drawFlags;"
+		" float fogEnd; float fogRange; uint fogColorPacked; };"
 		"cbuffer SkinConstants : register(b1) { row_major float4x4 bones[64]; };"
 		"cbuffer LightingConstants : register(b2) { float4 ambientLight;"
 		" float4 lightDirection; float4 lightColor; float4 surfaceProps; };"
@@ -266,7 +267,7 @@ createPipelineResources(void)
 		" float4 color : COLOR0; float2 uv : TEXCOORD0;"
 		" float4 weights : BLENDWEIGHT0; uint4 indices : BLENDINDICES0; };"
 		"struct VSOut { float4 position : SV_POSITION; float4 color : COLOR0;"
-		" float2 uv : TEXCOORD0; };"
+		" float2 uv : TEXCOORD0; float fogFactor : TEXCOORD1; };"
 		"VSOut VSMain(VSIn input) { VSOut output;"
 		" float4 localPosition = float4(input.position, 1.0);"
 		" float3 localNormal = input.normal;"
@@ -277,6 +278,8 @@ createPipelineResources(void)
 		" localNormal += mul(float4(input.normal, 0.0), bones[input.indices[i]]).xyz * input.weights[i]; } }"
 		" float4 p = mul(localPosition, world);"
 		" p = mul(p, view); output.position = mul(p, projection);"
+		" output.fogFactor = fogRange < 0.0 ?"
+		" saturate((p.z - fogEnd) * fogRange) : 1.0;"
 		" float3 normal = normalize(mul(float4(localNormal, 0.0), world).xyz);"
 		" float3 litColor = input.color.rgb + ambientLight.rgb * surfaceProps.x;"
 		" litColor += max(0.0, dot(normal, -lightDirection.xyz)) * lightColor.rgb * surfaceProps.z;"
@@ -286,6 +289,9 @@ createPipelineResources(void)
 		" float4 color = input.color;"
 		" if(drawFlags.x > 0.5) color *= diffuseTexture.Sample(diffuseSampler, input.uv);"
 		" clip(color.a - 0.02);"
+		" float3 fogColor = float3(fogColorPacked & 255u,"
+		" (fogColorPacked >> 8) & 255u, (fogColorPacked >> 16) & 255u) / 255.0;"
+		" color.rgb = lerp(fogColor, color.rgb, input.fogFactor);"
 		" return color; }";
 	ID3DBlob *vertexShader = nil;
 	ID3DBlob *pixelShader = nil;
@@ -690,7 +696,7 @@ renderGeometry(Atomic *atomic)
 	list->IASetVertexBuffers(0, 1, &header->vertexView);
 	list->IASetIndexBuffer(&header->indexView);
 
-	float constants[56];
+	float constants[59];
 	memset(constants, 0, sizeof(constants));
 	fillMatrix(constants, atomic->getFrame()->getLTM());
 	memcpy(constants + 16, &camera->devView, 16*sizeof(float));
@@ -700,6 +706,25 @@ renderGeometry(Atomic *atomic)
 	if(!uploadSkinMatrices(atomic, &boneAddress, &isSkinned))
 		return;
 	constants[53] = isSkinned ? 1.0f : 0.0f;
+	// World atomics are submitted from the renderer's fog-enabled passes, but
+	// later compatibility draws can change the global RW state. Use the camera
+	// range directly here so the modern backend cannot inherit a stale FALSE.
+	if(camera->fogPlane < camera->farPlane){
+		constants[56] = camera->farPlane;
+		constants[57] = 1.0f/(camera->fogPlane - camera->farPlane);
+	}
+	uint32 packedFog = (uint32)(uintptr_t)getRenderState(FOGCOLOR);
+	memcpy(&constants[58], &packedFog, sizeof(packedFog));
+	static bool32 tracedFogParameters;
+	if(!tracedFogParameters){
+		char message[192];
+		snprintf(message, sizeof(message),
+		         "fog camera start=%.3f end=%.3f range=%.8f state=%d color=%08X",
+		         camera->fogPlane, camera->farPlane, constants[57],
+		         getRenderState(FOGENABLE) != nil, packedFog);
+		tracePipeline(message);
+		tracedFogParameters = 1;
+	}
 	list->SetGraphicsRootConstantBufferView(2, boneAddress);
 	LightingConstants lighting;
 	collectLighting(atomic, &lighting);
@@ -738,7 +763,7 @@ renderGeometry(Atomic *atomic)
 		list->SetPipelineState(transparent ?
 			alphaPipelineState : opaquePipelineState);
 		constants[52] = textured ? 1.0f : 0.0f;
-		list->SetGraphicsRoot32BitConstants(0, 56, constants, 0);
+		list->SetGraphicsRoot32BitConstants(0, 59, constants, 0);
 		list->SetGraphicsRootDescriptorTable(1, texture);
 		list->DrawIndexedInstanced(header->meshes[i].numIndices, 1,
 		                           header->meshes[i].startIndex, 0, 0);

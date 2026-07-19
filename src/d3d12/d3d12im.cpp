@@ -402,7 +402,7 @@ initializeImmediate(void)
 	memset(im3DParams, 0, sizeof(im3DParams));
 	im3DParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 	im3DParams[0].Constants.ShaderRegister = 0;
-	im3DParams[0].Constants.Num32BitValues = 52;
+	im3DParams[0].Constants.Num32BitValues = 55;
 	im3DParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 	im3DParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 	im3DParams[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -433,15 +433,18 @@ initializeImmediate(void)
 	static const char *im3DShaderSource =
 		"cbuffer DrawConstants : register(b0) {"
 		" row_major float4x4 world; row_major float4x4 view;"
-		" row_major float4x4 projection; float4 drawFlags; };"
+		" row_major float4x4 projection; float4 drawFlags;"
+		" float fogEnd; float fogRange; uint fogColorPacked; };"
 		"Texture2D image : register(t0); SamplerState imageSampler : register(s0);"
 		"struct VSIn { float3 position : POSITION; uint color : COLOR0;"
 		" float2 uv : TEXCOORD0; };"
 		"struct VSOut { float4 position : SV_POSITION; float4 color : COLOR0;"
-		" float2 uv : TEXCOORD0; };"
+		" float2 uv : TEXCOORD0; float fogFactor : TEXCOORD1; };"
 		"VSOut VSMain(VSIn input) { VSOut output;"
 		" float4 p = mul(float4(input.position, 1.0), world);"
 		" p = mul(p, view); output.position = mul(p, projection);"
+		" output.fogFactor = fogRange < 0.0 ?"
+		" saturate((p.z - fogEnd) * fogRange) : 1.0;"
 		" output.color = float4((input.color >> 16) & 255,"
 		" (input.color >> 8) & 255, input.color & 255,"
 		" (input.color >> 24) & 255) / 255.0;"
@@ -450,6 +453,9 @@ initializeImmediate(void)
 		" float4 color = input.color;"
 		" if(drawFlags.x > 0.5) color *= image.Sample(imageSampler, input.uv);"
 		" clip(color.a - 0.02);"
+		" float3 fogColor = float3(fogColorPacked & 255u,"
+		" (fogColorPacked >> 8) & 255u, (fogColorPacked >> 16) & 255u) / 255.0;"
+		" color.rgb = lerp(fogColor, color.rgb, input.fogFactor);"
 		" return color; }";
 	vertexShader = nil;
 	pixelShader = nil;
@@ -875,7 +881,7 @@ drawIm3D(PrimitiveType type, uint16 *indices, int32 numIndices)
 	list->IASetVertexBuffers(0, 1, &im3DVertexView);
 	if(indices)
 		list->IASetIndexBuffer(&indexView);
-	float constants[52];
+	float constants[55];
 	memset(constants, 0, sizeof(constants));
 	memcpy(constants, im3DWorld, 16*sizeof(float));
 	memcpy(constants + 16, &camera->devView, 16*sizeof(float));
@@ -887,7 +893,14 @@ drawIm3D(PrimitiveType type, uint16 *indices, int32 numIndices)
 	if(!textured)
 		getTextureView(immediateWhiteRaster, &texture, nil);
 	constants[48] = textured ? 1.0f : 0.0f;
-	list->SetGraphicsRoot32BitConstants(0, 52, constants, 0);
+	if(getRenderState(FOGENABLE) != nil &&
+	   camera->fogPlane < camera->farPlane){
+		constants[52] = camera->farPlane;
+		constants[53] = 1.0f/(camera->fogPlane - camera->farPlane);
+	}
+	uint32 packedFog = (uint32)(uintptr_t)getRenderState(FOGCOLOR);
+	memcpy(&constants[54], &packedFog, sizeof(packedFog));
+	list->SetGraphicsRoot32BitConstants(0, 55, constants, 0);
 	list->SetGraphicsRootDescriptorTable(1, texture);
 	if(indices)
 		list->DrawIndexedInstanced(numIndices, 1, 0, 0, 0);
