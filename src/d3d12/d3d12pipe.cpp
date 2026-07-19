@@ -98,7 +98,10 @@ enum {
 	BONE_FRAME_COUNT = 3,
 	MAX_SKIN_BONES = 64,
 	MAX_WORLD_LIGHTS = 8,
-	BONE_UPLOAD_SIZE = 4*1024*1024
+	// A VR frame records the complete world twice before submission. The old
+	// one-view arena could run out midway through the right eye, silently making
+	// the remaining atomics (often vehicles and buildings) disappear.
+	BONE_UPLOAD_SIZE = 16*1024*1024
 };
 
 struct BoneArena

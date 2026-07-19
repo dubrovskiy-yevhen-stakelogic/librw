@@ -19,9 +19,23 @@ ID3D12DescriptorHeap *getShaderResourceHeap(void);
 ID3D12DescriptorHeap *getSamplerHeap(void);
 uint32 getFrameIndex(void);
 void getPresentSize(int32 *width, int32 *height);
+void setPresentInterval(uint32 interval);
+// Size of the camera raster currently bound by beginUpdate.  Im2D vertices
+// are expressed in pixels of that raster, which can differ from the desktop
+// swapchain for VR eyes, HUD layers and other camera textures.
+void getCurrentRenderTargetSize(int32 *width, int32 *height);
 bool32 readPresentedFrame(uint8 *pixels, uint32 stride,
                           int32 width, int32 height);
 bool32 prepareForReadback(void);
+// Submit the active command list to the graphics queue without stalling the
+// CPU. OpenXR owns completion synchronization after xrReleaseSwapchainImage.
+bool32 submitForExternal(void);
+// Submit the currently open graphics list and wait until resources shared with
+// an external compositor (OpenXR) are safe to release.
+bool32 submitAndWaitForExternal(void);
+bool32 copyCurrentBackBufferToExternal(ID3D12Resource *destination);
+bool32 uploadRgbaToExternal(ID3D12Resource *destination, const uint8 *pixels,
+                            uint32 stride, int32 width, int32 height);
 void deferRelease(IUnknown *object);
 
 bool32 allocateShaderResourceDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE *cpu,
@@ -44,6 +58,17 @@ bool32 getRasterResource(Raster *raster, ID3D12Resource **resource);
 bool32 transitionRaster(Raster *raster, D3D12_RESOURCE_STATES state);
 bool32 getTextureView(Raster *raster, D3D12_GPU_DESCRIPTOR_HANDLE *view,
                       bool32 *hasAlpha);
+// Draw a camera texture into an external typeless RGBA8 target while remapping
+// its UV rectangle. Used by OpenXR to convert the stable symmetric game view
+// into each runtime-provided asymmetric eye frustum.
+bool32 resolveRasterToExternal(Raster *source, ID3D12Resource *destination,
+                               int32 width, int32 height,
+                               float32 uvScaleX, float32 uvScaleY,
+                               float32 uvOffsetX, float32 uvOffsetY,
+                               bool32 fxaaEnabled, uint32 colorMode,
+                               const float32 blurColor[4],
+                               const float32 contrastMult[3],
+                               const float32 contrastAdd[3]);
 
 bool32 initializeImmediate(void);
 void shutdownImmediate(void);

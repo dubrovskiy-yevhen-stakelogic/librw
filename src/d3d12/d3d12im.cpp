@@ -28,7 +28,8 @@ namespace d3d12 {
 
 enum {
 	IMMEDIATE_FRAME_COUNT = 3,
-	IMMEDIATE_UPLOAD_SIZE = 8*1024*1024,
+	// Stereo records two full effect/Im2D/Im3D passes into one command list.
+	IMMEDIATE_UPLOAD_SIZE = 16*1024*1024,
 	RENDER_STATE_COUNT = GSALPHATESTREF + 1
 };
 
@@ -84,6 +85,8 @@ static ID3D12RootSignature *screenDropletRootSignature;
 static ID3D12PipelineState *screenDropletPipeline;
 static ID3D12RootSignature *postFXRootSignature;
 static ID3D12PipelineState *postFXPipeline;
+static ID3D12RootSignature *openXRResolveRootSignature;
+static ID3D12PipelineState *openXRResolvePipeline;
 static ID3D12RootSignature *im3DRootSignature;
 static ID3D12PipelineState *im3DPipelines[BLEND_MODE_COUNT][DEPTH_MODE_COUNT][STENCIL_MODE_COUNT][PIPELINE_TOPOLOGY_COUNT];
 static Raster *immediateWhiteRaster;
@@ -629,6 +632,140 @@ createPostFXResources(ID3D12Device *device)
 	return SUCCEEDED(hr);
 }
 
+static bool32
+createOpenXRResolveResources(ID3D12Device *device)
+{
+	D3D12_DESCRIPTOR_RANGE range;
+	memset(&range, 0, sizeof(range));
+	range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	range.NumDescriptors = 1;
+	range.BaseShaderRegister = 0;
+	range.OffsetInDescriptorsFromTableStart =
+		D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+	D3D12_ROOT_PARAMETER params[2];
+	memset(params, 0, sizeof(params));
+	params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+	params[0].Constants.ShaderRegister = 0;
+	params[0].Constants.Num32BitValues = 20;
+	params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+	params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	params[1].DescriptorTable.NumDescriptorRanges = 1;
+	params[1].DescriptorTable.pDescriptorRanges = &range;
+	params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	D3D12_STATIC_SAMPLER_DESC sampler;
+	memset(&sampler, 0, sizeof(sampler));
+	sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+	sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	sampler.MaxLOD = D3D12_FLOAT32_MAX;
+	sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	D3D12_ROOT_SIGNATURE_DESC signature;
+	memset(&signature, 0, sizeof(signature));
+	signature.NumParameters = 2;
+	signature.pParameters = params;
+	signature.NumStaticSamplers = 1;
+	signature.pStaticSamplers = &sampler;
+	ID3DBlob *serialized = nil;
+	ID3DBlob *errors = nil;
+	HRESULT hr = D3D12SerializeRootSignature(
+		&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors);
+	if(FAILED(hr)){
+		if(errors)
+			fprintf(stderr, "librw D3D12 OpenXR resolve root signature: %s\n",
+			        (const char*)errors->GetBufferPointer());
+		releaseCom(errors);
+		releaseCom(serialized);
+		return 0;
+	}
+	releaseCom(errors);
+	hr = device->CreateRootSignature(
+		0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+		IID_PPV_ARGS(&openXRResolveRootSignature));
+	releaseCom(serialized);
+	if(FAILED(hr))
+		return 0;
+
+	static const char *shaderSource =
+		"cbuffer ResolveConstants : register(b0) { float2 uvScale; float2 uvOffset;"
+		" float2 inverseSourceSize; uint fxaaEnabled; uint colorMode;"
+		" float4 blurColor; float4 contrastMult; float4 contrastAdd; };"
+		"Texture2D image : register(t0); SamplerState imageSampler : register(s0);"
+		"struct VSOut { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };"
+		"VSOut VSMain(uint id : SV_VertexID) { VSOut output;"
+		" float2 position = id == 0 ? float2(-1.0, -1.0) :"
+		"                   id == 1 ? float2(-1.0,  3.0) : float2(3.0, -1.0);"
+		" output.position = float4(position, 0.0, 1.0);"
+		" float2 sourceUV = float2((position.x + 1.0) * 0.5,"
+		"                          (1.0 - position.y) * 0.5);"
+		" output.uv = sourceUV; return output; }"
+		"float Luma(float3 color) { return dot(color, float3(0.299, 0.587, 0.114)); }"
+		"float3 SampleColor(float2 outputUV) {"
+		" float2 sourceUV = outputUV * uvScale + uvOffset;"
+		" return image.Sample(imageSampler, clamp(sourceUV, 0.0, 1.0)).rgb; }"
+		"float3 SamplePoint(float2 outputUV) {"
+		" float2 sourceUV=clamp(outputUV*uvScale+uvOffset,0.0,1.0-inverseSourceSize*0.5);"
+		" int2 texel=int2(sourceUV/inverseSourceSize); return image.Load(int3(texel,0)).rgb; }"
+		"float4 PSMain(VSOut input) : SV_TARGET {"
+		" float3 middle = fxaaEnabled!=0?SampleColor(input.uv):SamplePoint(input.uv);"
+		" float2 outputTexel=inverseSourceSize/max(uvScale,float2(0.00001,0.00001));"
+		" float3 nw = SampleColor(input.uv + float2(-1.0, -1.0) * outputTexel);"
+		" float3 ne = SampleColor(input.uv + float2( 1.0, -1.0) * outputTexel);"
+		" float3 sw = SampleColor(input.uv + float2(-1.0,  1.0) * outputTexel);"
+		" float3 se = SampleColor(input.uv + float2( 1.0,  1.0) * outputTexel);"
+		" float lm=Luma(middle), lnw=Luma(nw), lne=Luma(ne), lsw=Luma(sw), lse=Luma(se);"
+		" float lmin=min(lm,min(min(lnw,lne),min(lsw,lse)));"
+		" float lmax=max(lm,max(max(lnw,lne),max(lsw,lse)));"
+		" float2 direction=float2(-((lnw+lne)-(lsw+lse)),((lnw+lsw)-(lne+lse)));"
+		" float reduce=max((lnw+lne+lsw+lse)*0.03125,0.0078125);"
+		" direction=clamp(direction/(min(abs(direction.x),abs(direction.y))+reduce),-8.0,8.0)*outputTexel;"
+		" float3 a=0.5*(SampleColor(input.uv+direction*(1.0/3.0-0.5))+SampleColor(input.uv+direction*(2.0/3.0-0.5)));"
+		" float3 b=a*0.5+0.25*(SampleColor(input.uv+direction*-0.5)+SampleColor(input.uv+direction*0.5));"
+		" float lb=Luma(b); float3 color=fxaaEnabled!=0?((lb<lmin||lb>lmax)?a:b):middle;"
+		" if(colorMode==1) { float alpha=blurColor.a; float3 doubled=saturate(blurColor.rgb*2.0);"
+		"  float3 original=color, previous=color; [unroll] for(int i=0;i<5;i++) {"
+		"   float3 filtered=original*(1.0-alpha)+previous*doubled*alpha;"
+		"   filtered+=previous*blurColor.rgb*2.0; previous=saturate(filtered); } color=previous; }"
+		" else if(colorMode==2) color=saturate(color*contrastMult.rgb+contrastAdd.rgb);"
+		" return float4(color,1.0); }";
+	ID3DBlob *vertexShader = nil;
+	ID3DBlob *pixelShader = nil;
+	if(!compileShader(shaderSource, "VSMain", "vs_5_0", &vertexShader) ||
+	   !compileShader(shaderSource, "PSMain", "ps_5_0", &pixelShader)){
+		releaseCom(vertexShader);
+		releaseCom(pixelShader);
+		return 0;
+	}
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
+	memset(&desc, 0, sizeof(desc));
+	desc.pRootSignature = openXRResolveRootSignature;
+	desc.VS.pShaderBytecode = vertexShader->GetBufferPointer();
+	desc.VS.BytecodeLength = vertexShader->GetBufferSize();
+	desc.PS.pShaderBytecode = pixelShader->GetBufferPointer();
+	desc.PS.BytecodeLength = pixelShader->GetBufferSize();
+	desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+	desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	desc.RasterizerState.DepthClipEnable = TRUE;
+	desc.BlendState.RenderTarget[0].BlendEnable = FALSE;
+	desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+		D3D12_COLOR_WRITE_ENABLE_ALL;
+	desc.DepthStencilState.DepthEnable = FALSE;
+	desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+	desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+	desc.SampleMask = UINT_MAX;
+	desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	desc.NumRenderTargets = 1;
+	// OpenXR exposes its RGBA8 swapchain resources as TYPELESS, allowing this
+	// UNORM RTV while the compositor still interprets the declared sRGB format.
+	desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+	desc.SampleDesc.Count = 1;
+	hr = device->CreateGraphicsPipelineState(
+		&desc, IID_PPV_ARGS(&openXRResolvePipeline));
+	releaseCom(vertexShader);
+	releaseCom(pixelShader);
+	return SUCCEEDED(hr);
+}
+
 bool32
 initializeImmediate(void)
 {
@@ -760,6 +897,10 @@ initializeImmediate(void)
 		return 0;
 	}
 	if(!createPostFXResources(device)){
+		shutdownImmediate();
+		return 0;
+	}
+	if(!createOpenXRResolveResources(device)){
 		shutdownImmediate();
 		return 0;
 	}
@@ -951,6 +1092,8 @@ shutdownImmediate(void)
 	releaseCom(screenDropletRootSignature);
 	releaseCom(postFXPipeline);
 	releaseCom(postFXRootSignature);
+	releaseCom(openXRResolvePipeline);
+	releaseCom(openXRResolveRootSignature);
 	for(uint32 blend = 0; blend < BLEND_MODE_COUNT; blend++)
 		for(uint32 depth = 0; depth < DEPTH_MODE_COUNT; depth++)
 			for(uint32 stencil = 0; stencil < STENCIL_MODE_COUNT; stencil++)
@@ -1114,7 +1257,7 @@ drawImmediate(PrimitiveType type, Im2DVertex *vertices, int32 numVertices,
 	if(indices)
 		list->IASetIndexBuffer(&indexView);
 	int32 width, height;
-	getPresentSize(&width, &height);
+	getCurrentRenderTargetSize(&width, &height);
 	float screen[2] = {
 		(float)(width > 0 ? width : 1), (float)(height > 0 ? height : 1)
 	};
@@ -1173,7 +1316,7 @@ renderScreenDroplets(void *vertices, int32 numVertices, int32 vertexStride,
 	list->IASetVertexBuffers(0, 1, &vertexView);
 	list->IASetIndexBuffer(&indexView);
 	int32 width, height;
-	getPresentSize(&width, &height);
+	getCurrentRenderTargetSize(&width, &height);
 	float screen[2] = {
 		(float)(width > 0 ? width : 1), (float)(height > 0 ? height : 1)
 	};
@@ -1227,7 +1370,7 @@ renderPostFX(void *vertices, int32 numVertices, int32 vertexStride,
 		float effect1[4];
 	} constants;
 	int32 width, height;
-	getPresentSize(&width, &height);
+	getCurrentRenderTargetSize(&width, &height);
 	constants.screenSize[0] = (float)(width > 0 ? width : 1);
 	constants.screenSize[1] = (float)(height > 0 ? height : 1);
 	constants.effectMode = effectMode;
@@ -1237,6 +1380,92 @@ renderPostFX(void *vertices, int32 numVertices, int32 vertexStride,
 	list->SetGraphicsRoot32BitConstants(0, 12, &constants, 0);
 	list->SetGraphicsRootDescriptorTable(1, sceneView);
 	list->DrawIndexedInstanced(numIndices, 1, 0, 0, 0);
+	return 1;
+}
+
+bool32
+resolveRasterToExternal(Raster *source, ID3D12Resource *destination,
+	                    int32 width, int32 height,
+	                    float32 uvScaleX, float32 uvScaleY,
+	                    float32 uvOffsetX, float32 uvOffsetY,
+	                    bool32 fxaaEnabled, uint32 colorMode,
+	                    const float32 blurColor[4],
+	                    const float32 contrastMult[3],
+	                    const float32 contrastAdd[3])
+{
+	if(!immediateReady || openXRResolvePipeline == nil ||
+	   openXRResolveRootSignature == nil || source == nil ||
+	   destination == nil || width <= 0 || height <= 0 ||
+	   blurColor == nil || contrastMult == nil || contrastAdd == nil)
+		return 0;
+	ID3D12Device *device = getDevice();
+	ID3D12GraphicsCommandList *list = getCommandList();
+	if(device == nil || list == nil)
+		return 0;
+	if(!transitionRaster(source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
+		return 0;
+	D3D12_GPU_DESCRIPTOR_HANDLE sourceView;
+	if(!getTextureView(source, &sourceView, nil))
+		return 0;
+	D3D12_CPU_DESCRIPTOR_HANDLE targetView;
+	uint32 targetViewIndex = UINT32_MAX;
+	if(!allocateRenderTargetDescriptor(&targetView, &targetViewIndex))
+		return 0;
+	D3D12_RENDER_TARGET_VIEW_DESC viewDesc;
+	memset(&viewDesc, 0, sizeof(viewDesc));
+	viewDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	viewDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+	device->CreateRenderTargetView(destination, &viewDesc, targetView);
+
+	D3D12_RESOURCE_BARRIER barrier;
+	memset(&barrier, 0, sizeof(barrier));
+	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barrier.Transition.pResource = destination;
+	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	list->ResourceBarrier(1, &barrier);
+	list->OMSetRenderTargets(1, &targetView, FALSE, nil);
+	D3D12_VIEWPORT viewport = {
+		0.0f, 0.0f, (float)width, (float)height, 0.0f, 1.0f
+	};
+	D3D12_RECT scissor = { 0, 0, (LONG)width, (LONG)height };
+	list->RSSetViewports(1, &viewport);
+	list->RSSetScissorRects(1, &scissor);
+	ID3D12DescriptorHeap *heap = getShaderResourceHeap();
+	if(heap)
+		list->SetDescriptorHeaps(1, &heap);
+	list->SetGraphicsRootSignature(openXRResolveRootSignature);
+	list->SetPipelineState(openXRResolvePipeline);
+	list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	struct ResolveConstants {
+		float uvScale[2];
+		float uvOffset[2];
+		float inverseSourceSize[2];
+		uint32 fxaaEnabled;
+		uint32 colorMode;
+		float blurColor[4];
+		float contrastMult[4];
+		float contrastAdd[4];
+	} constants = {};
+	constants.uvScale[0] = uvScaleX;
+	constants.uvScale[1] = uvScaleY;
+	constants.uvOffset[0] = uvOffsetX;
+	constants.uvOffset[1] = uvOffsetY;
+	constants.inverseSourceSize[0] = 1.0f/(float)source->width;
+	constants.inverseSourceSize[1] = 1.0f/(float)source->height;
+	constants.fxaaEnabled = fxaaEnabled != 0;
+	constants.colorMode = colorMode;
+	memcpy(constants.blurColor, blurColor, sizeof(constants.blurColor));
+	memcpy(constants.contrastMult, contrastMult, 3*sizeof(float));
+	memcpy(constants.contrastAdd, contrastAdd, 3*sizeof(float));
+	list->SetGraphicsRoot32BitConstants(0, 20, &constants, 0);
+	list->SetGraphicsRootDescriptorTable(1, sourceView);
+	list->DrawInstanced(3, 1, 0, 0);
+	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+	list->ResourceBarrier(1, &barrier);
+	deferDescriptorRelease(UINT32_MAX, targetViewIndex, UINT32_MAX);
 	return 1;
 }
 

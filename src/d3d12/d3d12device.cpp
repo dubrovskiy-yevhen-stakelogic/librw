@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <stdio.h>
 #include <vector>
 
 #ifdef RW_D3D12
@@ -112,8 +113,11 @@ struct D3D12Context
 	UINT nextSamplerDescriptor;
 	UINT frameIndex;
 	UINT lastPresentedFrame;
+	UINT presentInterval;
 	int32 width;
 	int32 height;
+	int32 currentTargetWidth;
+	int32 currentTargetHeight;
 	int32 desktopWidth;
 	int32 desktopHeight;
 	int32 currentVideoMode;
@@ -138,11 +142,58 @@ struct D3D12Context
 };
 
 static D3D12Context context;
+static uint32 externalCopyLogCount;
+
+static void
+logExternalCopy(const char *message, const D3D12_RESOURCE_DESC *source = nil,
+	            const D3D12_RESOURCE_DESC *destination = nil, HRESULT result = S_OK)
+{
+	if(externalCopyLogCount++ >= 32)
+		return;
+	FILE *file = fopen("d3d12_external_copy.log", externalCopyLogCount == 1 ? "w" : "a");
+	if(file == nil)
+		return;
+	fprintf(file,
+	        "%s hr=%08lX frameOpen=%d hasPresented=%d frame=%u last=%u ready=%d",
+	        message, (unsigned long)result, (int)context.frameOpen,
+	        (int)context.hasPresentedFrame, (unsigned)context.frameIndex,
+	        (unsigned)context.lastPresentedFrame, (int)context.presentationReady);
+	if(source)
+		fprintf(file, " src=%llux%u fmt=%u samples=%u state=%s",
+		        (unsigned long long)source->Width, (unsigned)source->Height,
+		        (unsigned)source->Format, (unsigned)source->SampleDesc.Count,
+		        context.frameOpen ? "render-target" : "present");
+	if(destination)
+		fprintf(file, " dst=%llux%u fmt=%u samples=%u",
+		        (unsigned long long)destination->Width, (unsigned)destination->Height,
+		        (unsigned)destination->Format,
+		        (unsigned)destination->SampleDesc.Count);
+	fputc('\n', file);
+	fclose(file);
+}
 
 static D3D12_RESOURCE_BARRIER transitionBarrier(
 	ID3D12Resource *resource, D3D12_RESOURCE_STATES before,
 	D3D12_RESOURCE_STATES after);
 static void finishFrame(void);
+
+static bool32
+areCopyCompatibleFormats(DXGI_FORMAT source, DXGI_FORMAT destination)
+{
+	if(source == destination)
+		return 1;
+	// OpenXR runtimes commonly expose an UNORM swapchain through a typeless
+	// ID3D12Resource. D3D12 explicitly permits copies inside the same typeless
+	// format family, so do not reject these resources before CopyResource.
+	if((source == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+	    source == DXGI_FORMAT_R8G8B8A8_UNORM ||
+	    source == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) &&
+	   (destination == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+	    destination == DXGI_FORMAT_R8G8B8A8_UNORM ||
+	    destination == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB))
+		return 1;
+	return 0;
+}
 
 template<class T>
 static void
@@ -197,6 +248,28 @@ getPresentSize(int32 *width, int32 *height)
 		*width = context.width;
 	if(height)
 		*height = context.height;
+}
+
+void
+setPresentInterval(uint32 interval)
+{
+	// OpenXR already provides the frame pacing for VR.  Waiting for the
+	// desktop swapchain as well can serialize two unrelated refresh rates and
+	// make scripted camera sequences run below real time.
+	context.presentInterval = interval ? 1u : 0u;
+}
+
+void
+getCurrentRenderTargetSize(int32 *width, int32 *height)
+{
+	const int32 targetWidth = context.currentTargetWidth > 0 ?
+		context.currentTargetWidth : context.width;
+	const int32 targetHeight = context.currentTargetHeight > 0 ?
+		context.currentTargetHeight : context.height;
+	if(width)
+		*width = targetWidth;
+	if(height)
+		*height = targetHeight;
 }
 
 bool32
@@ -310,6 +383,186 @@ prepareForReadback(void)
 	if(context.frameOpen)
 		finishFrame();
 	return waitForGpu();
+}
+
+bool32
+submitForExternal(void)
+{
+	if(context.device == nil || context.queue == nil)
+		return 0;
+	if(context.frameOpen)
+		finishFrame();
+	return 1;
+}
+
+bool32
+submitAndWaitForExternal(void)
+{
+	if(!submitForExternal())
+		return 0;
+	return waitForGpu();
+}
+
+bool32
+copyCurrentBackBufferToExternal(ID3D12Resource *destination)
+{
+	if(destination == nil || context.device == nil || context.queue == nil){
+		logExternalCopy("missing destination/device/queue");
+		return 0;
+	}
+	const bool32 useOpenFrame = context.frameOpen && context.commandList != nil &&
+		context.backBuffers[context.frameIndex] != nil;
+	if(!useOpenFrame && (!context.hasPresentedFrame ||
+	   context.lastPresentedFrame >= FRAME_COUNT ||
+	   context.backBuffers[context.lastPresentedFrame] == nil)){
+		logExternalCopy("no open or presented source");
+		return 0;
+	}
+	ID3D12Resource *source = useOpenFrame ?
+		context.backBuffers[context.frameIndex] :
+		context.backBuffers[context.lastPresentedFrame];
+	D3D12_RESOURCE_DESC sourceDesc = source->GetDesc();
+	D3D12_RESOURCE_DESC destinationDesc = destination->GetDesc();
+	if(sourceDesc.Dimension != destinationDesc.Dimension ||
+	   sourceDesc.Width != destinationDesc.Width ||
+	   sourceDesc.Height != destinationDesc.Height ||
+	   !areCopyCompatibleFormats(sourceDesc.Format, destinationDesc.Format) ||
+	   sourceDesc.SampleDesc.Count != destinationDesc.SampleDesc.Count){
+		logExternalCopy("resource mismatch", &sourceDesc, &destinationDesc);
+		return 0;
+	}
+	logExternalCopy(useOpenFrame ? "copy from open frame" : "copy from presented frame",
+	                &sourceDesc, &destinationDesc);
+
+	if(!useOpenFrame){
+		// Menus and startup movies can close/present their regular frame before the
+		// OpenXR cinema layer asks for it. Copy the last presented image through a
+		// short independent list; this intentionally costs one frame of latency only
+		// in the mono theatre path.
+		if(!waitForGpu()){
+			logExternalCopy("pre-copy wait failed", &sourceDesc, &destinationDesc);
+			return 0;
+		}
+		ID3D12CommandAllocator *allocator = nil;
+		ID3D12GraphicsCommandList *list = nil;
+		bool32 ok = SUCCEEDED(context.device->CreateCommandAllocator(
+			D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) &&
+			SUCCEEDED(context.device->CreateCommandList(
+				0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nil,
+				IID_PPV_ARGS(&list)));
+		if(ok){
+			D3D12_RESOURCE_BARRIER barriers[2] = {
+				transitionBarrier(source, D3D12_RESOURCE_STATE_PRESENT,
+				                  D3D12_RESOURCE_STATE_COPY_SOURCE),
+				transitionBarrier(destination, D3D12_RESOURCE_STATE_COMMON,
+				                  D3D12_RESOURCE_STATE_COPY_DEST)
+			};
+			list->ResourceBarrier(2, barriers);
+			list->CopyResource(destination, source);
+			barriers[0] = transitionBarrier(source, D3D12_RESOURCE_STATE_COPY_SOURCE,
+			                                D3D12_RESOURCE_STATE_PRESENT);
+			barriers[1] = transitionBarrier(destination, D3D12_RESOURCE_STATE_COPY_DEST,
+			                                D3D12_RESOURCE_STATE_COMMON);
+			list->ResourceBarrier(2, barriers);
+			ok = SUCCEEDED(list->Close());
+		}
+		if(ok){
+			ID3D12CommandList *lists[] = { list };
+			context.queue->ExecuteCommandLists(1, lists);
+			ok = waitForGpu();
+		}
+		if(!ok)
+			logExternalCopy("independent copy failed", &sourceDesc, &destinationDesc);
+		releaseCom(list);
+		releaseCom(allocator);
+		return ok;
+	}
+
+	D3D12_RESOURCE_BARRIER barriers[2] = {
+		transitionBarrier(source, D3D12_RESOURCE_STATE_RENDER_TARGET,
+		                  D3D12_RESOURCE_STATE_COPY_SOURCE),
+		transitionBarrier(destination, D3D12_RESOURCE_STATE_COMMON,
+		                  D3D12_RESOURCE_STATE_COPY_DEST)
+	};
+	context.commandList->ResourceBarrier(2, barriers);
+	context.commandList->CopyResource(destination, source);
+	barriers[0] = transitionBarrier(source, D3D12_RESOURCE_STATE_COPY_SOURCE,
+	                                D3D12_RESOURCE_STATE_RENDER_TARGET);
+	barriers[1] = transitionBarrier(destination, D3D12_RESOURCE_STATE_COPY_DEST,
+	                                D3D12_RESOURCE_STATE_COMMON);
+	context.commandList->ResourceBarrier(2, barriers);
+	return 1;
+}
+
+bool32
+uploadRgbaToExternal(ID3D12Resource *destination, const uint8 *pixels,
+	                 uint32 stride, int32 width, int32 height)
+{
+	if(destination == nil || pixels == nil || context.device == nil ||
+	   context.commandList == nil || !context.frameOpen ||
+	   width <= 0 || height <= 0 || stride < (uint32)width*4)
+		return 0;
+	D3D12_RESOURCE_DESC texture = destination->GetDesc();
+	if(texture.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+	   texture.Width != (UINT64)width || texture.Height != (UINT)height ||
+	   !areCopyCompatibleFormats(DXGI_FORMAT_R8G8B8A8_UNORM, texture.Format))
+		return 0;
+
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+	UINT rows = 0;
+	UINT64 rowSize = 0;
+	UINT64 uploadSize = 0;
+	context.device->GetCopyableFootprints(&texture, 0, 1, 0, &footprint,
+	                                     &rows, &rowSize, &uploadSize);
+	D3D12_HEAP_PROPERTIES heap = {};
+	heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+	heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+	heap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+	heap.CreationNodeMask = 1;
+	heap.VisibleNodeMask = 1;
+	D3D12_RESOURCE_DESC buffer = {};
+	buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	buffer.Width = uploadSize;
+	buffer.Height = 1;
+	buffer.DepthOrArraySize = 1;
+	buffer.MipLevels = 1;
+	buffer.SampleDesc.Count = 1;
+	buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	ID3D12Resource *upload = nil;
+	if(FAILED(context.device->CreateCommittedResource(
+	   &heap, D3D12_HEAP_FLAG_NONE, &buffer,
+	   D3D12_RESOURCE_STATE_GENERIC_READ, nil, IID_PPV_ARGS(&upload))))
+		return 0;
+	uint8 *mapped = nil;
+	D3D12_RANGE readRange = { 0, 0 };
+	if(FAILED(upload->Map(0, &readRange, (void**)&mapped))){
+		releaseCom(upload);
+		return 0;
+	}
+	const uint32 copyBytes = (uint32)width*4;
+	for(UINT row = 0; row < rows && row < (UINT)height; row++)
+		memcpy(mapped + footprint.Offset + row*footprint.Footprint.RowPitch,
+		       pixels + row*stride, copyBytes);
+	upload->Unmap(0, nil);
+
+	D3D12_RESOURCE_BARRIER barrier = transitionBarrier(
+		destination, D3D12_RESOURCE_STATE_COMMON,
+		D3D12_RESOURCE_STATE_COPY_DEST);
+	context.commandList->ResourceBarrier(1, &barrier);
+	D3D12_TEXTURE_COPY_LOCATION source = {};
+	source.pResource = upload;
+	source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	source.PlacedFootprint = footprint;
+	D3D12_TEXTURE_COPY_LOCATION target = {};
+	target.pResource = destination;
+	target.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	target.SubresourceIndex = 0;
+	context.commandList->CopyTextureRegion(&target, 0, 0, 0, &source, nil);
+	barrier = transitionBarrier(destination, D3D12_RESOURCE_STATE_COPY_DEST,
+	                           D3D12_RESOURCE_STATE_COMMON);
+	context.commandList->ResourceBarrier(1, &barrier);
+	deferRelease(upload);
+	return 1;
 }
 
 static void
@@ -606,6 +859,8 @@ destroyFrameResources(void)
 	context.currentColorResource = nil;
 	context.currentColorView.ptr = 0;
 	context.currentDepthView.ptr = 0;
+	context.currentTargetWidth = 0;
+	context.currentTargetHeight = 0;
 	releaseCom(context.commandList);
 	for(uint32 i = 0; i < FRAME_COUNT; i++){
 		releaseCom(context.commandAllocators[i]);
@@ -827,6 +1082,8 @@ beginFrame(Camera *camera)
 		(float)frameBuffer->offsetY : 0.0f;
 	viewport.Width = (float)(frameBuffer ? frameBuffer->width : context.width);
 	viewport.Height = (float)(frameBuffer ? frameBuffer->height : context.height);
+	context.currentTargetWidth = frameBuffer ? frameBuffer->width : context.width;
+	context.currentTargetHeight = frameBuffer ? frameBuffer->height : context.height;
 	viewport.MinDepth = 0.0f;
 	viewport.MaxDepth = 1.0f;
 	D3D12_RECT scissor = {
@@ -921,6 +1178,8 @@ finishFrame(void)
 	context.currentColorRaster = nil;
 	context.currentColorResource = nil;
 	context.currentColorView.ptr = 0;
+	context.currentTargetWidth = 0;
+	context.currentTargetHeight = 0;
 
 	if(context.backBufferRendering){
 		D3D12_RESOURCE_BARRIER barrier = transitionBarrier(
@@ -950,7 +1209,7 @@ showRaster(Raster*, uint32)
 	if(context.frameOpen)
 		finishFrame();
 	UINT presentedFrame = context.frameIndex;
-	if(FAILED(context.swapChain->Present(1, 0)))
+	if(FAILED(context.swapChain->Present(context.presentInterval, 0)))
 		return;
 	context.lastPresentedFrame = presentedFrame;
 	context.hasPresentedFrame = 1;
@@ -1172,6 +1431,7 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 		if(context.desktopHeight <= 0)
 			context.desktopHeight = context.height;
 		context.currentVideoMode = 0;
+		context.presentInterval = 1;
 		if(context.window){
 			RECT rect;
 			if(GetClientRect(context.window, &rect)){
