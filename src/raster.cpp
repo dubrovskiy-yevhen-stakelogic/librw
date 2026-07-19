@@ -77,7 +77,13 @@ Raster::create(int32 width, int32 height, int32 depth, int32 format, int32 platf
 	s_plglist.construct(raster);
 
 //	printf("%d %d %d %d\n", raster->type, raster->width, raster->height, raster->depth);
-	return engine->driver[raster->platform]->rasterCreate(raster);
+	Raster *created = engine->driver[raster->platform]->rasterCreate(raster);
+	if(created == nil){
+		s_plglist.destruct(raster);
+		rwFree(raster);
+		numAllocated--;
+	}
+	return created;
 }
 
 void
@@ -500,6 +506,8 @@ rw::Raster*
 Raster::convertTexToCurrentPlatform(rw::Raster *ras)
 {
 	using namespace rw;
+	if(ras == nil)
+		return nil;
 
 	if(ras->platform == rw::platform)
 		return ras;
@@ -532,12 +540,22 @@ Raster::convertTexToCurrentPlatform(rw::Raster *ras)
 	// fall back to going through Image directly
 	int32 width, height, depth, format;
 	Image *img = ras->toImage();
+	if(img == nil)
+		return nil;
 	// TODO: maybe don't *always* do this?
 	img->unpalettize();
 	Raster::imageFindRasterFormat(img, Raster::TEXTURE, &width, &height, &depth, &format);
 	format |= ras->format & (Raster::MIPMAP | Raster::AUTOMIPMAP);
 	Raster *newras = Raster::create(width, height, depth, format);
-	newras->setFromImage(img);
+	if(newras == nil){
+		img->destroy();
+		return nil;
+	}
+	if(!newras->setFromImage(img)){
+		newras->destroy();
+		img->destroy();
+		return nil;
+	}
 	img->destroy();
 	int numLevels = ras->getNumLevels();
 	for(int i = 1; i < numLevels; i++){

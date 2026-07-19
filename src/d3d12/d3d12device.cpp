@@ -133,6 +133,7 @@ struct D3D12Context
 	D3D12_CPU_DESCRIPTOR_HANDLE currentColorView;
 	D3D12_CPU_DESCRIPTOR_HANDLE currentDepthView;
 	std::vector<IUnknown*> deferredReleases[FRAME_COUNT];
+	std::vector<IUnknown*> pendingSubmitReleases;
 	std::vector<uint32> deferredSrvDescriptors[FRAME_COUNT];
 	std::vector<uint32> deferredRtvDescriptors[FRAME_COUNT];
 	std::vector<uint32> deferredDsvDescriptors[FRAME_COUNT];
@@ -587,6 +588,14 @@ releaseDeferredFrame(uint32 frame)
 	context.deferredDsvDescriptors[frame].clear();
 }
 
+static void
+releasePendingSubmitObjects(void)
+{
+	for(size_t i = 0; i < context.pendingSubmitReleases.size(); i++)
+		context.pendingSubmitReleases[i]->Release();
+	context.pendingSubmitReleases.clear();
+}
+
 void
 deferRelease(IUnknown *object)
 {
@@ -597,6 +606,18 @@ deferRelease(IUnknown *object)
 		return;
 	}
 	context.deferredReleases[context.frameIndex % FRAME_COUNT].push_back(object);
+}
+
+void
+deferReleaseAfterNextSubmit(IUnknown *object)
+{
+	if(object == nil)
+		return;
+	if(context.device == nil){
+		object->Release();
+		return;
+	}
+	context.pendingSubmitReleases.push_back(object);
 }
 
 void
@@ -835,6 +856,9 @@ waitForGpu(void)
 			return 0;
 		WaitForSingleObject(context.fenceEvent, INFINITE);
 	}
+	// This signal is ordered after standalone texture-copy command lists.
+	// Their temporary upload resources can now be released safely.
+	releasePendingSubmitObjects();
 	return 1;
 }
 
@@ -1196,8 +1220,17 @@ finishFrame(void)
 	ID3D12CommandList *lists[] = { context.commandList };
 	context.queue->ExecuteCommandLists(1, lists);
 	const UINT64 value = ++context.fenceValue;
-	if(SUCCEEDED(context.queue->Signal(context.fence, value)))
+	if(SUCCEEDED(context.queue->Signal(context.fence, value))){
 		context.frameFenceValues[context.frameIndex] = value;
+		// Standalone uploads were submitted before this frame list. Associate
+		// their temporary resources with the fence we have just signalled, not
+		// with the stale fence that beginFrame already waited for.
+		context.deferredReleases[context.frameIndex].insert(
+			context.deferredReleases[context.frameIndex].end(),
+			context.pendingSubmitReleases.begin(),
+			context.pendingSubmitReleases.end());
+		context.pendingSubmitReleases.clear();
+	}
 	context.frameOpen = 0;
 }
 
@@ -1274,6 +1307,7 @@ destroyCoreDevice(void)
 {
 	if(context.queue && context.fence && context.fenceEvent)
 		waitForGpu();
+	releasePendingSubmitObjects();
 	for(uint32 i = 0; i < FRAME_COUNT; i++)
 		releaseDeferredFrame(i);
 	destroyFrameResources();

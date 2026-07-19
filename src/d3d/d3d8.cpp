@@ -514,6 +514,11 @@ readAsImage(Stream *stream, int32 width, int32 height, int32 depth, int32 format
 			Raster::imageFindRasterFormat(img, format&7, &width, &height, &depth, &newformat);
 			newformat |= format & (Raster::MIPMAP | Raster::AUTOMIPMAP);
 			ras = Raster::create(width, height, depth, newformat);
+			if(ras == nil){
+				rwFree(data);
+				img->destroy();
+				return nil;
+			}
 			ras->lock(i, Raster::LOCKWRITE|Raster::LOCKNOFETCH);
 		}
 

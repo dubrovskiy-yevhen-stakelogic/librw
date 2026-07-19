@@ -37,6 +37,9 @@ bool32 copyCurrentBackBufferToExternal(ID3D12Resource *destination);
 bool32 uploadRgbaToExternal(ID3D12Resource *destination, const uint8 *pixels,
                             uint32 stride, int32 width, int32 height);
 void deferRelease(IUnknown *object);
+// Upload command allocators, lists and buffers are submitted before the next
+// presented frame. Keep them alive until that frame's fence has completed.
+void deferReleaseAfterNextSubmit(IUnknown *object);
 
 bool32 allocateShaderResourceDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE *cpu,
                                         D3D12_GPU_DESCRIPTOR_HANDLE *gpu,
