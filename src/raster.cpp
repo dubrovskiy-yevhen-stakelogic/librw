@@ -12,6 +12,7 @@
 //#include "ps2/rwps2.h"
 #include "d3d/rwd3d.h"
 #include "d3d/rwxbox.h"
+#include "d3d12/rwd3d12.h"
 //#include "d3d/rwd3d8.h"
 //#include "d3d/rwd3d9.h"
 #include "gl/rwgl3.h"
@@ -467,6 +468,171 @@ d3d_to_gl3(rw::Raster *ras)
 }
 
 static rw::Raster*
+d3d_to_d3d12(rw::Raster *ras)
+{
+#ifdef RW_D3D12
+	using namespace rw;
+
+	d3d::D3dRaster *source = GETD3DRASTEREXT(ras);
+	// Preserve DXT blocks all the way into native BC resources. The former
+	// fallback decompressed every streamed texture into temporary RGBA Images,
+	// multiplied its upload size, and produced the recurring 2 ms CPU stalls.
+	if(source->customFormat){
+		int32 dxt = 0;
+		switch(source->format){
+		case d3d::D3DFMT_DXT1: dxt = 1; break;
+		case d3d::D3DFMT_DXT2: dxt = 2; break;
+		case d3d::D3DFMT_DXT3: dxt = 3; break;
+		case d3d::D3DFMT_DXT4: dxt = 4; break;
+		case d3d::D3DFMT_DXT5: dxt = 5; break;
+		default: return nil;
+		}
+		const int32 levels = ras->getNumLevels();
+		Raster *converted = Raster::create(ras->width, ras->height,
+			ras->depth, ras->format | Raster::TEXTURE |
+			Raster::DONTALLOCATE, PLATFORM_D3D12);
+		if(converted == nil ||
+		   !d3d12::allocateDXT(converted, dxt, levels,
+		                             source->hasAlpha)){
+			if(converted) converted->destroy();
+			return nil;
+		}
+		for(int32 level = 0; level < levels; level++){
+			uint8 *src = ras->lock(level, Raster::LOCKREAD);
+			uint8 *dst = converted->lock(level,
+				Raster::LOCKWRITE | Raster::LOCKNOFETCH);
+			if(src == nil || dst == nil){
+				if(dst) converted->unlock(level);
+				if(src) ras->unlock(level);
+				converted->destroy();
+				return nil;
+			}
+			memcpy(dst, src, d3d::getLevelSize(ras, level));
+			converted->unlock(level);
+			ras->unlock(level);
+		}
+		return converted;
+	}
+
+	// Uncompressed world TXDs can likewise be expanded straight into D3D12
+	// backing memory without constructing two temporary Images.
+	if(ras->format & Raster::PAL4)
+		return nil;
+
+	const int32 colorFormat = ras->format & 0xF00;
+	const bool32 pal8 = (ras->format & Raster::PAL8) != 0;
+	if(!pal8 && colorFormat != Raster::C8888 &&
+	   colorFormat != Raster::C888 && colorFormat != Raster::C1555 &&
+	   colorFormat != Raster::C555 && colorFormat != Raster::C565 &&
+	   colorFormat != Raster::C4444 && colorFormat != Raster::LUM8)
+		return nil;
+
+	const int32 mipFlags = ras->format &
+		(Raster::MIPMAP | Raster::AUTOMIPMAP);
+	Raster *converted = Raster::create(ras->width, ras->height, 32,
+		Raster::C8888 | Raster::TEXTURE | mipFlags, PLATFORM_D3D12);
+	if(converted == nil)
+		return nil;
+	d3d12::setRasterHasAlpha(converted,
+		source->hasAlpha || colorFormat == Raster::C8888 ||
+		colorFormat == Raster::C1555 || colorFormat == Raster::C4444);
+
+	uint32 palette[256] = {};
+	if(pal8){
+		const uint8 *srcPalette = (const uint8*)source->palette;
+		if(srcPalette == nil){
+			converted->destroy();
+			return nil;
+		}
+		for(int32 i = 0; i < 256; i++)
+			palette[i] = (uint32)srcPalette[i*4+2] |
+				((uint32)srcPalette[i*4+1] << 8) |
+				((uint32)srcPalette[i*4] << 16) |
+				((uint32)srcPalette[i*4+3] << 24);
+	}
+
+	const int32 levels = ras->getNumLevels() < converted->getNumLevels() ?
+		ras->getNumLevels() : converted->getNumLevels();
+	for(int32 level = 0; level < levels; level++){
+		uint8 *src = ras->lock(level, Raster::LOCKREAD);
+		if(src == nil){
+			converted->destroy();
+			return nil;
+		}
+		const int32 width = ras->width;
+		const int32 height = ras->height;
+		const int32 srcStride = ras->stride;
+		uint8 *dst = converted->lock(level,
+			Raster::LOCKWRITE | Raster::LOCKNOFETCH);
+		if(dst == nil){
+			ras->unlock(level);
+			converted->destroy();
+			return nil;
+		}
+		const int32 dstStride = converted->stride;
+
+		for(int32 y = 0; y < height; y++){
+			const uint8 *srcRow = src + y*srcStride;
+			uint8 *dstRow = dst + y*dstStride;
+			if(pal8){
+				uint32 *out = (uint32*)dstRow;
+				for(int32 x = 0; x < width; x++)
+					out[x] = palette[srcRow[x]];
+			}else if(colorFormat == Raster::C8888)
+				memcpy(dstRow, srcRow, width*4);
+			else if(colorFormat == Raster::C888){
+				for(int32 x = 0; x < width; x++){
+					dstRow[x*4] = srcRow[x*3];
+					dstRow[x*4+1] = srcRow[x*3+1];
+					dstRow[x*4+2] = srcRow[x*3+2];
+					dstRow[x*4+3] = 0xFF;
+				}
+			}else if(colorFormat == Raster::LUM8){
+				for(int32 x = 0; x < width; x++){
+					const uint8 l = srcRow[x];
+					dstRow[x*4] = l;
+					dstRow[x*4+1] = l;
+					dstRow[x*4+2] = l;
+					dstRow[x*4+3] = 0xFF;
+				}
+			}else{
+				for(int32 x = 0; x < width; x++){
+					const uint16 pixel = (uint16)srcRow[x*2] |
+						((uint16)srcRow[x*2+1] << 8);
+					uint32 r, g, b, a = 0xFF;
+					if(colorFormat == Raster::C565){
+						b = (pixel & 0x1F)*255/31;
+						g = ((pixel >> 5) & 0x3F)*255/63;
+						r = ((pixel >> 11) & 0x1F)*255/31;
+					}else if(colorFormat == Raster::C4444){
+						b = (pixel & 0xF)*17;
+						g = ((pixel >> 4) & 0xF)*17;
+						r = ((pixel >> 8) & 0xF)*17;
+						a = ((pixel >> 12) & 0xF)*17;
+					}else{
+						b = (pixel & 0x1F)*255/31;
+						g = ((pixel >> 5) & 0x1F)*255/31;
+						r = ((pixel >> 10) & 0x1F)*255/31;
+						if(colorFormat == Raster::C1555)
+							a = (pixel & 0x8000) ? 0xFF : 0;
+					}
+					dstRow[x*4] = (uint8)b;
+					dstRow[x*4+1] = (uint8)g;
+					dstRow[x*4+2] = (uint8)r;
+					dstRow[x*4+3] = (uint8)a;
+				}
+			}
+		}
+		converted->unlock(level);
+		ras->unlock(level);
+	}
+	return converted;
+#else
+	return nil;
+#endif
+}
+
+static rw::Raster*
 xbox_to_gl3(rw::Raster *ras)
 {
 #ifdef RW_GL3
@@ -519,6 +685,13 @@ Raster::convertTexToCurrentPlatform(rw::Raster *ras)
 	// special cased conversion for DXT
 	if((ras->platform == PLATFORM_D3D8 || ras->platform == PLATFORM_D3D9) && rw::platform == PLATFORM_GL3){
 		Raster *newras = d3d_to_gl3(ras);
+		if(newras){
+			ras->destroy();
+			return newras;
+		}
+	}else if((ras->platform == PLATFORM_D3D8 || ras->platform == PLATFORM_D3D9) &&
+	         rw::platform == PLATFORM_D3D12){
+		Raster *newras = d3d_to_d3d12(ras);
 		if(newras){
 			ras->destroy();
 			return newras;

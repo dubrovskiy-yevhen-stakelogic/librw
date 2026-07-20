@@ -82,6 +82,36 @@ enum {
 	SAMPLER_ADDRESS_COUNT = 5
 };
 
+struct PendingTextureUpload
+{
+	ID3D12Resource *destination;
+	ID3D12Resource *upload;
+	D3D12_RESOURCE_STATES before;
+	D3D12_RESOURCE_STATES after;
+	uint32 firstLevel;
+	uint32 levelCount;
+};
+
+struct TextureHeapBlock
+{
+	UINT64 offset;
+	UINT64 size;
+};
+
+struct TextureHeapPage
+{
+	ID3D12Heap *heap;
+	UINT64 size;
+	std::vector<TextureHeapBlock> freeBlocks;
+};
+
+struct TextureHeapAllocation
+{
+	uint32 page;
+	UINT64 offset;
+	UINT64 size;
+};
+
 struct D3D12Context
 {
 	HWND window;
@@ -134,6 +164,10 @@ struct D3D12Context
 	D3D12_CPU_DESCRIPTOR_HANDLE currentDepthView;
 	std::vector<IUnknown*> deferredReleases[FRAME_COUNT];
 	std::vector<IUnknown*> pendingSubmitReleases;
+	std::vector<PendingTextureUpload> pendingTextureUploads;
+	std::vector<TextureHeapPage> textureHeapPages;
+	std::vector<TextureHeapAllocation> deferredTextureAllocations[FRAME_COUNT];
+	std::vector<TextureHeapAllocation> pendingTextureAllocations;
 	std::vector<uint32> deferredSrvDescriptors[FRAME_COUNT];
 	std::vector<uint32> deferredRtvDescriptors[FRAME_COUNT];
 	std::vector<uint32> deferredDsvDescriptors[FRAME_COUNT];
@@ -144,6 +178,142 @@ struct D3D12Context
 
 static D3D12Context context;
 static uint32 externalCopyLogCount;
+
+static UINT64
+alignTextureHeapOffset(UINT64 value, UINT64 alignment)
+{
+	return alignment > 1 ? (value + alignment - 1) & ~(alignment - 1) : value;
+}
+
+static void
+freeTextureAllocationNow(const TextureHeapAllocation &allocation)
+{
+	if(allocation.page >= context.textureHeapPages.size() ||
+	   allocation.size == 0)
+		return;
+	std::vector<TextureHeapBlock> &blocks =
+		context.textureHeapPages[allocation.page].freeBlocks;
+	TextureHeapBlock returned = { allocation.offset, allocation.size };
+	size_t position = 0;
+	while(position < blocks.size() && blocks[position].offset < returned.offset)
+		position++;
+	blocks.insert(blocks.begin() + position, returned);
+	for(size_t i = 0; i + 1 < blocks.size(); ){
+		TextureHeapBlock &left = blocks[i];
+		TextureHeapBlock &right = blocks[i+1];
+		if(left.offset + left.size >= right.offset){
+			const UINT64 rightEnd = right.offset + right.size;
+			if(rightEnd > left.offset + left.size)
+				left.size = rightEnd - left.offset;
+			blocks.erase(blocks.begin() + i + 1);
+		}else
+			i++;
+	}
+}
+
+bool32
+allocatePlacedTextureResource(const D3D12_RESOURCE_DESC *desc,
+	                          D3D12_RESOURCE_STATES initialState,
+	                          ID3D12Resource **resource,
+	                          uint32 *heapPage, uint64 *heapOffset,
+	                          uint64 *heapSize)
+{
+	if(context.device == nil || desc == nil || resource == nil ||
+	   heapPage == nil || heapOffset == nil || heapSize == nil ||
+	   desc->Flags != D3D12_RESOURCE_FLAG_NONE)
+		return 0;
+	D3D12_RESOURCE_ALLOCATION_INFO info =
+		context.device->GetResourceAllocationInfo(0, 1, desc);
+	if(info.SizeInBytes == 0 || info.SizeInBytes == UINT64_MAX)
+		return 0;
+
+	uint32 selectedPage = UINT32_MAX;
+	UINT64 selectedOffset = 0;
+	for(uint32 pageIndex = 0; pageIndex < context.textureHeapPages.size();
+	    pageIndex++){
+		std::vector<TextureHeapBlock> &blocks =
+			context.textureHeapPages[pageIndex].freeBlocks;
+		for(size_t blockIndex = 0; blockIndex < blocks.size(); blockIndex++){
+			TextureHeapBlock block = blocks[blockIndex];
+			const UINT64 offset = alignTextureHeapOffset(block.offset, info.Alignment);
+			if(offset < block.offset || offset + info.SizeInBytes > block.offset + block.size)
+				continue;
+			blocks.erase(blocks.begin() + blockIndex);
+			size_t insertPosition = blockIndex;
+			if(offset > block.offset){
+				TextureHeapBlock prefix = { block.offset, offset - block.offset };
+				blocks.insert(blocks.begin() + insertPosition, prefix);
+				insertPosition++;
+			}
+			const UINT64 end = offset + info.SizeInBytes;
+			if(end < block.offset + block.size){
+				TextureHeapBlock suffix = { end, block.offset + block.size - end };
+				blocks.insert(blocks.begin() + insertPosition, suffix);
+			}
+			selectedPage = pageIndex;
+			selectedOffset = offset;
+			break;
+		}
+		if(selectedPage != UINT32_MAX)
+			break;
+	}
+
+	if(selectedPage == UINT32_MAX){
+		const UINT64 pageMinimum = 128ull*1024ull*1024ull;
+		const UINT64 pageSize = alignTextureHeapOffset(
+			info.SizeInBytes > pageMinimum ? info.SizeInBytes : pageMinimum,
+			D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+		D3D12_HEAP_DESC heapDesc = {};
+		heapDesc.SizeInBytes = pageSize;
+		heapDesc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+		heapDesc.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+		heapDesc.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+		heapDesc.Properties.CreationNodeMask = 1;
+		heapDesc.Properties.VisibleNodeMask = 1;
+		heapDesc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+		TextureHeapPage page = {};
+		if(FAILED(context.device->CreateHeap(&heapDesc,
+		                                    IID_PPV_ARGS(&page.heap))))
+			return 0;
+		page.size = pageSize;
+		if(info.SizeInBytes < pageSize){
+			TextureHeapBlock remainder = { info.SizeInBytes,
+			                                   pageSize - info.SizeInBytes };
+			page.freeBlocks.push_back(remainder);
+		}
+		context.textureHeapPages.push_back(page);
+		selectedPage = (uint32)context.textureHeapPages.size() - 1;
+		selectedOffset = 0;
+	}
+
+	HRESULT result = context.device->CreatePlacedResource(
+		context.textureHeapPages[selectedPage].heap, selectedOffset, desc,
+		initialState, nil, IID_PPV_ARGS(resource));
+	if(FAILED(result)){
+		TextureHeapAllocation failed = {
+			selectedPage, selectedOffset, info.SizeInBytes
+		};
+		freeTextureAllocationNow(failed);
+		return 0;
+	}
+	*heapPage = selectedPage;
+	*heapOffset = selectedOffset;
+	*heapSize = info.SizeInBytes;
+	return 1;
+}
+
+void
+deferTextureAllocationRelease(uint32 heapPage, uint64 heapOffset,
+	                          uint64 heapSize)
+{
+	if(heapPage == UINT32_MAX || heapSize == 0)
+		return;
+	TextureHeapAllocation allocation = { heapPage, heapOffset, heapSize };
+	// Always associate reuse with the next submitted fence. A freshly streamed
+	// texture may still be waiting in pendingTextureUploads when its RW raster
+	// is destroyed before the next beginFrame.
+	context.pendingTextureAllocations.push_back(allocation);
+}
 
 static void
 logExternalCopy(const char *message, const D3D12_RESOURCE_DESC *source = nil,
@@ -574,6 +744,9 @@ releaseDeferredFrame(uint32 frame)
 	for(size_t i = 0; i < context.deferredReleases[frame].size(); i++)
 		context.deferredReleases[frame][i]->Release();
 	context.deferredReleases[frame].clear();
+	for(size_t i = 0; i < context.deferredTextureAllocations[frame].size(); i++)
+		freeTextureAllocationNow(context.deferredTextureAllocations[frame][i]);
+	context.deferredTextureAllocations[frame].clear();
 	context.freeSrvDescriptors.insert(context.freeSrvDescriptors.end(),
 		context.deferredSrvDescriptors[frame].begin(),
 		context.deferredSrvDescriptors[frame].end());
@@ -594,6 +767,90 @@ releasePendingSubmitObjects(void)
 	for(size_t i = 0; i < context.pendingSubmitReleases.size(); i++)
 		context.pendingSubmitReleases[i]->Release();
 	context.pendingSubmitReleases.clear();
+}
+
+static void
+releasePendingTextureUploads(void)
+{
+	for(size_t i = 0; i < context.pendingTextureUploads.size(); i++){
+		releaseCom(context.pendingTextureUploads[i].upload);
+		releaseCom(context.pendingTextureUploads[i].destination);
+	}
+	context.pendingTextureUploads.clear();
+}
+
+bool32
+queueTextureUpload(ID3D12Resource *destination,
+	               D3D12_RESOURCE_STATES before,
+	               D3D12_RESOURCE_STATES after,
+	               ID3D12Resource *upload,
+	               uint32 firstLevel, uint32 levelCount)
+{
+	if(context.device == nil || destination == nil || upload == nil ||
+	   levelCount == 0 || levelCount > 16)
+		return 0;
+	PendingTextureUpload pending;
+	pending.destination = destination;
+	pending.upload = upload;
+	pending.before = before;
+	pending.after = after;
+	pending.firstLevel = firstLevel;
+	pending.levelCount = levelCount;
+	destination->AddRef();
+	context.pendingTextureUploads.push_back(pending);
+	return 1;
+}
+
+static void
+recordPendingTextureUploads(void)
+{
+	if(context.commandList == nil || context.device == nil)
+		return;
+	for(size_t pendingIndex = 0;
+	    pendingIndex < context.pendingTextureUploads.size(); pendingIndex++){
+		PendingTextureUpload &pending =
+			context.pendingTextureUploads[pendingIndex];
+		if(pending.before != D3D12_RESOURCE_STATE_COPY_DEST){
+			D3D12_RESOURCE_BARRIER barrier = transitionBarrier(
+				pending.destination, pending.before,
+				D3D12_RESOURCE_STATE_COPY_DEST);
+			context.commandList->ResourceBarrier(1, &barrier);
+		}
+
+		D3D12_RESOURCE_DESC texture = pending.destination->GetDesc();
+		D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[16];
+		UINT rows[16] = {};
+		UINT64 rowSizes[16] = {};
+		UINT64 totalSize = 0;
+		context.device->GetCopyableFootprints(
+			&texture, pending.firstLevel, pending.levelCount, 0,
+			footprints, rows, rowSizes, &totalSize);
+		for(uint32 i = 0; i < pending.levelCount; i++){
+			D3D12_TEXTURE_COPY_LOCATION destination;
+			memset(&destination, 0, sizeof(destination));
+			destination.pResource = pending.destination;
+			destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			destination.SubresourceIndex = pending.firstLevel + i;
+			D3D12_TEXTURE_COPY_LOCATION source;
+			memset(&source, 0, sizeof(source));
+			source.pResource = pending.upload;
+			source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			source.PlacedFootprint = footprints[i];
+			context.commandList->CopyTextureRegion(
+				&destination, 0, 0, 0, &source, nil);
+		}
+		if(pending.after != D3D12_RESOURCE_STATE_COPY_DEST){
+			D3D12_RESOURCE_BARRIER barrier = transitionBarrier(
+				pending.destination, D3D12_RESOURCE_STATE_COPY_DEST,
+				pending.after);
+			context.commandList->ResourceBarrier(1, &barrier);
+		}
+		deferRelease(pending.upload);
+		deferRelease(pending.destination);
+		pending.upload = nil;
+		pending.destination = nil;
+	}
+	context.pendingTextureUploads.clear();
 }
 
 void
@@ -1073,6 +1330,7 @@ beginFrame(Camera *camera)
 			context.commandList->SetDescriptorHeaps(2, heaps);
 		}
 		context.frameOpen = 1;
+		recordPendingTextureUploads();
 	}
 
 	Raster *frameBuffer = camera ? camera->frameBuffer : nil;
@@ -1230,6 +1488,11 @@ finishFrame(void)
 			context.pendingSubmitReleases.begin(),
 			context.pendingSubmitReleases.end());
 		context.pendingSubmitReleases.clear();
+		context.deferredTextureAllocations[context.frameIndex].insert(
+			context.deferredTextureAllocations[context.frameIndex].end(),
+			context.pendingTextureAllocations.begin(),
+			context.pendingTextureAllocations.end());
+		context.pendingTextureAllocations.clear();
 	}
 	context.frameOpen = 0;
 }
@@ -1307,10 +1570,17 @@ destroyCoreDevice(void)
 {
 	if(context.queue && context.fence && context.fenceEvent)
 		waitForGpu();
+	releasePendingTextureUploads();
 	releasePendingSubmitObjects();
 	for(uint32 i = 0; i < FRAME_COUNT; i++)
 		releaseDeferredFrame(i);
+	for(size_t i = 0; i < context.pendingTextureAllocations.size(); i++)
+		freeTextureAllocationNow(context.pendingTextureAllocations[i]);
+	context.pendingTextureAllocations.clear();
 	destroyFrameResources();
+	for(size_t i = 0; i < context.textureHeapPages.size(); i++)
+		releaseCom(context.textureHeapPages[i].heap);
+	context.textureHeapPages.clear();
 
 	if(context.fenceEvent){
 		CloseHandle(context.fenceEvent);
@@ -1339,6 +1609,7 @@ destroyCoreDevice(void)
 		context.deferredSrvDescriptors[i].clear();
 		context.deferredRtvDescriptors[i].clear();
 		context.deferredDsvDescriptors[i].clear();
+		context.deferredTextureAllocations[i].clear();
 	}
 	memset(context.samplerCache, 0, sizeof(context.samplerCache));
 	context.initialized = 0;

@@ -12,6 +12,36 @@ struct Raster;
 
 namespace d3d12 {
 
+// CPU-side cost accumulated while the current streaming item creates and
+// uploads D3D12 textures. The OpenXR profiler snapshots this alongside the
+// slowest streamed item so texture stalls can be split into allocator, copy
+// and command-recording costs without doing synchronous per-texture logging.
+struct TextureUploadProfile
+{
+	float32 defaultResourceMs;
+	float32 descriptorMs;
+	float32 footprintMs;
+	float32 uploadResourceMs;
+	float32 cpuCopyMs;
+	float32 queueMs;
+	uint64 uploadBytes;
+	uint32 textureResources;
+	uint32 uploads;
+};
+
+void resetTextureUploadProfile(void);
+void getTextureUploadProfile(TextureUploadProfile *profile);
+
+// Suballocate ordinary sampled textures from large default heaps. Render
+// targets and depth buffers keep their dedicated committed-resource path.
+bool32 allocatePlacedTextureResource(const D3D12_RESOURCE_DESC *desc,
+                                     D3D12_RESOURCE_STATES initialState,
+                                     ID3D12Resource **resource,
+                                     uint32 *heapPage, uint64 *heapOffset,
+                                     uint64 *heapSize);
+void deferTextureAllocationRelease(uint32 heapPage, uint64 heapOffset,
+                                   uint64 heapSize);
+
 ID3D12Device *getDevice(void);
 ID3D12CommandQueue *getCommandQueue(void);
 ID3D12GraphicsCommandList *getCommandList(void);
@@ -40,6 +70,13 @@ void deferRelease(IUnknown *object);
 // Upload command allocators, lists and buffers are submitted before the next
 // presented frame. Keep them alive until that frame's fence has completed.
 void deferReleaseAfterNextSubmit(IUnknown *object);
+// Queue a texture copy for the next regular frame command list. Ownership of
+// upload transfers to the queue on success.
+bool32 queueTextureUpload(ID3D12Resource *destination,
+                          D3D12_RESOURCE_STATES before,
+                          D3D12_RESOURCE_STATES after,
+                          ID3D12Resource *upload,
+                          uint32 firstLevel, uint32 levelCount);
 
 bool32 allocateShaderResourceDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE *cpu,
                                         D3D12_GPU_DESCRIPTOR_HANDLE *gpu,

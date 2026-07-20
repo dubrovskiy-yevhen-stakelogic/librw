@@ -28,6 +28,9 @@ bool32 imageFindRasterFormat(Image *image, int32 type,
                              int32 *depth, int32 *format);
 bool32 rasterFromImage(Raster *raster, Image *image);
 Image *rasterToImage(Raster *raster);
+void setRasterHasAlpha(Raster *raster, bool32 hasAlpha);
+bool32 allocateDXT(Raster *raster, int32 dxt, int32 numLevels,
+                   bool32 hasAlpha);
 
 ObjPipeline *makeDefaultPipeline(void);
 void shutdownDefaultPipeline(void);

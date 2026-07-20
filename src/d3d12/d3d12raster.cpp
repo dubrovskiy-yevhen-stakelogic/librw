@@ -32,6 +32,32 @@ int32 nativeRasterOffset;
 
 enum { MAX_MIP_LEVELS = 16 };
 
+static TextureUploadProfile textureUploadProfile;
+
+static double
+textureProfileNowMs(void)
+{
+	static LARGE_INTEGER frequency = {};
+	if(frequency.QuadPart == 0)
+		QueryPerformanceFrequency(&frequency);
+	LARGE_INTEGER counter;
+	QueryPerformanceCounter(&counter);
+	return counter.QuadPart * 1000.0 / frequency.QuadPart;
+}
+
+void
+resetTextureUploadProfile(void)
+{
+	memset(&textureUploadProfile, 0, sizeof(textureUploadProfile));
+}
+
+void
+getTextureUploadProfile(TextureUploadProfile *profile)
+{
+	if(profile)
+		*profile = textureUploadProfile;
+}
+
 struct D3D12Raster
 {
 	ID3D12Resource *resource;
@@ -51,6 +77,11 @@ struct D3D12Raster
 	bool32 hasAlpha;
 	uint32 dirtyLevels;
 	bool32 uploaded;
+	bool32 directWriteLock;
+	DXGI_FORMAT gpuFormat;
+	uint32 heapPage;
+	uint64 heapOffset;
+	uint64 heapSize;
 };
 
 #define GETD3D12RASTEREXT(raster) \
@@ -143,15 +174,29 @@ createTextureResource(Raster *raster, D3D12Raster *nativeRaster)
 		initialState = D3D12_RESOURCE_STATE_RENDER_TARGET;
 	}
 
+	DXGI_FORMAT format = nativeRaster->gpuFormat;
+	if(format == DXGI_FORMAT_UNKNOWN)
+		format = raster->type == Raster::CAMERATEXTURE ?
+			DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
 	D3D12_RESOURCE_DESC desc = textureDesc(
 		raster->width, raster->height, (uint16)nativeRaster->numLevels,
-		raster->type == Raster::CAMERATEXTURE ?
-			DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM,
-		flags);
-	D3D12_HEAP_PROPERTIES props = heapProperties(D3D12_HEAP_TYPE_DEFAULT);
-	HRESULT result = device->CreateCommittedResource(
-	       &props, D3D12_HEAP_FLAG_NONE, &desc, initialState, nil,
-	       IID_PPV_ARGS(&nativeRaster->resource));
+		format, flags);
+	double profileStart = textureProfileNowMs();
+	HRESULT result = S_OK;
+	if(raster->type != Raster::CAMERATEXTURE){
+		if(!allocatePlacedTextureResource(&desc, initialState,
+		       &nativeRaster->resource, &nativeRaster->heapPage,
+		       &nativeRaster->heapOffset, &nativeRaster->heapSize))
+			result = E_OUTOFMEMORY;
+	}else{
+		D3D12_HEAP_PROPERTIES props = heapProperties(D3D12_HEAP_TYPE_DEFAULT);
+		result = device->CreateCommittedResource(
+		       &props, D3D12_HEAP_FLAG_NONE, &desc, initialState, nil,
+		       IID_PPV_ARGS(&nativeRaster->resource));
+	}
+	textureUploadProfile.defaultResourceMs +=
+		(float32)(textureProfileNowMs() - profileStart);
+	textureUploadProfile.textureResources++;
 	if(FAILED(result)){
 		logTextureCreateFailure("CreateCommittedResource", raster,
 			nativeRaster->numLevels, result);
@@ -159,9 +204,12 @@ createTextureResource(Raster *raster, D3D12Raster *nativeRaster)
 	}
 	nativeRaster->state = initialState;
 
+	profileStart = textureProfileNowMs();
 	if(!allocateShaderResourceDescriptor(&nativeRaster->srvCpu,
 	                                     &nativeRaster->srvGpu,
 	                                     &nativeRaster->srvIndex)){
+		textureUploadProfile.descriptorMs +=
+			(float32)(textureProfileNowMs() - profileStart);
 		logTextureCreateFailure("AllocateSRV", raster,
 			nativeRaster->numLevels, E_OUTOFMEMORY);
 		return 0;
@@ -182,6 +230,8 @@ createTextureResource(Raster *raster, D3D12Raster *nativeRaster)
 		device->CreateRenderTargetView(nativeRaster->resource, nil,
 		                               nativeRaster->rtv);
 	}
+	textureUploadProfile.descriptorMs +=
+		(float32)(textureProfileNowMs() - profileStart);
 	return 1;
 }
 
@@ -222,8 +272,7 @@ uploadLevels(Raster *raster, D3D12Raster *nativeRaster,
 	          uint32 firstLevel, uint32 levelCount)
 {
 	ID3D12Device *device = getDevice();
-	ID3D12CommandQueue *queue = getCommandQueue();
-	if(device == nil || queue == nil || nativeRaster->resource == nil ||
+	if(device == nil || nativeRaster->resource == nil ||
 	   levelCount == 0 || firstLevel >= nativeRaster->numLevels ||
 	   firstLevel + levelCount > nativeRaster->numLevels)
 		return 0;
@@ -233,8 +282,11 @@ uploadLevels(Raster *raster, D3D12Raster *nativeRaster,
 	UINT numRows[MAX_MIP_LEVELS] = {};
 	UINT64 rowSizes[MAX_MIP_LEVELS] = {};
 	UINT64 uploadSize = 0;
+	double profileStart = textureProfileNowMs();
 	device->GetCopyableFootprints(&texture, firstLevel, levelCount, 0,
 	                             footprints, numRows, rowSizes, &uploadSize);
+	textureUploadProfile.footprintMs +=
+		(float32)(textureProfileNowMs() - profileStart);
 
 	D3D12_RESOURCE_DESC buffer;
 	memset(&buffer, 0, sizeof(buffer));
@@ -248,11 +300,18 @@ uploadLevels(Raster *raster, D3D12Raster *nativeRaster,
 
 	ID3D12Resource *upload = nil;
 	D3D12_HEAP_PROPERTIES uploadProps = heapProperties(D3D12_HEAP_TYPE_UPLOAD);
-	if(FAILED(device->CreateCommittedResource(
+	profileStart = textureProfileNowMs();
+	HRESULT uploadResult = device->CreateCommittedResource(
 	       &uploadProps, D3D12_HEAP_FLAG_NONE, &buffer,
-	       D3D12_RESOURCE_STATE_GENERIC_READ, nil, IID_PPV_ARGS(&upload))))
+	       D3D12_RESOURCE_STATE_GENERIC_READ, nil, IID_PPV_ARGS(&upload));
+	textureUploadProfile.uploadResourceMs +=
+		(float32)(textureProfileNowMs() - profileStart);
+	textureUploadProfile.uploadBytes += uploadSize;
+	textureUploadProfile.uploads++;
+	if(FAILED(uploadResult))
 		return 0;
 
+	profileStart = textureProfileNowMs();
 	uint8 *mapped = nil;
 	D3D12_RANGE readRange = { 0, 0 };
 	if(FAILED(upload->Map(0, &readRange, (void**)&mapped))){
@@ -269,64 +328,50 @@ uploadLevels(Raster *raster, D3D12Raster *nativeRaster,
 			       nativeRaster->levelStride[level]);
 	}
 	upload->Unmap(0, nil);
+	textureUploadProfile.cpuCopyMs +=
+		(float32)(textureProfileNowMs() - profileStart);
 
-	ID3D12CommandAllocator *allocator = nil;
-	ID3D12GraphicsCommandList *list = nil;
-	bool32 ok = SUCCEEDED(device->CreateCommandAllocator(
-		D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) &&
-		SUCCEEDED(device->CreateCommandList(
-		0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nil,
-		IID_PPV_ARGS(&list)));
-	if(!ok){
-		releaseCom(list);
-		releaseCom(allocator);
-		releaseCom(upload);
-		return 0;
-	}
-
-	if(nativeRaster->state != D3D12_RESOURCE_STATE_COPY_DEST){
+	profileStart = textureProfileNowMs();
+	bool32 ok = 0;
+	ID3D12GraphicsCommandList *list = getCommandList();
+	if(list){
+		if(nativeRaster->state != D3D12_RESOURCE_STATE_COPY_DEST){
+			D3D12_RESOURCE_BARRIER barrier = transitionBarrier(
+				nativeRaster->resource, nativeRaster->state,
+				D3D12_RESOURCE_STATE_COPY_DEST);
+			list->ResourceBarrier(1, &barrier);
+		}
+		for(uint32 i = 0; i < levelCount; i++){
+			D3D12_TEXTURE_COPY_LOCATION dst;
+			memset(&dst, 0, sizeof(dst));
+			dst.pResource = nativeRaster->resource;
+			dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			dst.SubresourceIndex = firstLevel + i;
+			D3D12_TEXTURE_COPY_LOCATION src;
+			memset(&src, 0, sizeof(src));
+			src.pResource = upload;
+			src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			src.PlacedFootprint = footprints[i];
+			list->CopyTextureRegion(&dst, 0, 0, 0, &src, nil);
+		}
 		D3D12_RESOURCE_BARRIER barrier = transitionBarrier(
-			nativeRaster->resource, nativeRaster->state,
-			D3D12_RESOURCE_STATE_COPY_DEST);
+			nativeRaster->resource, D3D12_RESOURCE_STATE_COPY_DEST,
+			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		list->ResourceBarrier(1, &barrier);
-	}
-	for(uint32 i = 0; i < levelCount; i++){
-		D3D12_TEXTURE_COPY_LOCATION dst;
-		memset(&dst, 0, sizeof(dst));
-		dst.pResource = nativeRaster->resource;
-		dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-		dst.SubresourceIndex = firstLevel + i;
-		D3D12_TEXTURE_COPY_LOCATION src;
-		memset(&src, 0, sizeof(src));
-		src.pResource = upload;
-		src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-		src.PlacedFootprint = footprints[i];
-		list->CopyTextureRegion(&dst, 0, 0, 0, &src, nil);
-	}
-	D3D12_RESOURCE_BARRIER barrier = transitionBarrier(
-		nativeRaster->resource, D3D12_RESOURCE_STATE_COPY_DEST,
-		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-	list->ResourceBarrier(1, &barrier);
-	nativeRaster->state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-	ok = SUCCEEDED(list->Close());
-	if(ok){
-		ID3D12CommandList *lists[] = { list };
-		queue->ExecuteCommandLists(1, lists);
-		// Queue ordering guarantees that the upload completes before the frame
-		// command list which samples this texture. Waiting here serialized the CPU
-		// with the entire GPU once for every mip in every streamed TXD, producing
-		// 20-200 ms stalls during the hotel drive. Keep the temporary upload objects
-		// alive until this swapchain frame's fence is reached instead.
-		deferReleaseAfterNextSubmit(upload);
-		deferReleaseAfterNextSubmit(list);
-		deferReleaseAfterNextSubmit(allocator);
+		deferRelease(upload);
 		upload = nil;
-		list = nil;
-		allocator = nil;
+		ok = 1;
+	}else if(queueTextureUpload(nativeRaster->resource, nativeRaster->state,
+	         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, upload,
+	         firstLevel, levelCount)){
+		upload = nil;
+		ok = 1;
 	}
-	releaseCom(list);
-	releaseCom(allocator);
+	if(ok)
+		nativeRaster->state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 	releaseCom(upload);
+	textureUploadProfile.queueMs +=
+		(float32)(textureProfileNowMs() - profileStart);
 	return ok;
 }
 
@@ -443,6 +488,8 @@ rasterCreate(Raster *raster)
 	D3D12Raster *nativeRaster = GETD3D12RASTEREXT(raster);
 	nativeRaster->numLevels = 1;
 	nativeRaster->hasAlpha = 0;
+	nativeRaster->gpuFormat = raster->type == Raster::CAMERATEXTURE ?
+		DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
 
 	if(raster->width == 0 || raster->height == 0){
 		raster->flags |= Raster::DONTALLOCATE;
@@ -537,10 +584,23 @@ rasterLock(Raster *raster, int32 level, int32 lockMode)
 	raster->width = width;
 	raster->height = height;
 	raster->stride = nativeRaster->levelStride[level];
-	raster->pixels = (uint8*)rwMalloc(nativeRaster->levelSize[level],
-	                                  MEMDUR_EVENT | ID_DRIVER);
-	if(raster->pixels == nil)
-		return nil;
+	// Native texture conversion fills a complete mip and does not need the old
+	// contents. Write directly into the persistent CPU backing store in that
+	// case; the old path allocated a temporary buffer and copied every mip a
+	// second time before uploading it.
+	nativeRaster->directWriteLock =
+		(lockMode & Raster::LOCKWRITE) != 0 &&
+		(lockMode & Raster::LOCKNOFETCH) != 0 &&
+		(lockMode & Raster::LOCKREAD) == 0 &&
+		raster->type != Raster::CAMERATEXTURE;
+	if(nativeRaster->directWriteLock)
+		raster->pixels = nativeRaster->backingStore[level];
+	else{
+		raster->pixels = (uint8*)rwMalloc(nativeRaster->levelSize[level],
+		                                  MEMDUR_EVENT | ID_DRIVER);
+		if(raster->pixels == nil)
+			return nil;
+	}
 	if((lockMode & Raster::LOCKNOFETCH) == 0 ||
 	   (lockMode & Raster::LOCKREAD)){
 		if(raster->type == Raster::CAMERATEXTURE &&
@@ -575,8 +635,9 @@ rasterUnlock(Raster *raster, int32 level)
 	D3D12Raster *nativeRaster = GETD3D12RASTEREXT(raster);
 	if(raster->pixels && (raster->privateFlags & Raster::LOCKWRITE) &&
 	   level >= 0 && (uint32)level < nativeRaster->numLevels){
-		memcpy(nativeRaster->backingStore[level], raster->pixels,
-		       nativeRaster->levelSize[level]);
+		if(!nativeRaster->directWriteLock)
+			memcpy(nativeRaster->backingStore[level], raster->pixels,
+			       nativeRaster->levelSize[level]);
 		nativeRaster->dirtyLevels |= 1u << level;
 		if(nativeRaster->uploaded){
 			if(!uploadLevels(raster, nativeRaster, level, 1))
@@ -594,13 +655,85 @@ rasterUnlock(Raster *raster, int32 level)
 			}
 		}
 	}
-	if(raster->pixels)
+	if(raster->pixels && !nativeRaster->directWriteLock)
 		rwFree(raster->pixels);
+	nativeRaster->directWriteLock = 0;
 	raster->width = raster->originalWidth;
 	raster->height = raster->originalHeight;
 	raster->stride = raster->originalStride;
 	raster->pixels = raster->originalPixels;
 	raster->privateFlags = 0;
+#endif
+}
+
+void
+setRasterHasAlpha(Raster *raster, bool32 hasAlpha)
+{
+#ifdef RW_D3D12
+	if(raster && raster->platform == PLATFORM_D3D12)
+		GETD3D12RASTEREXT(raster)->hasAlpha = hasAlpha;
+#else
+	(void)raster;
+	(void)hasAlpha;
+#endif
+}
+
+bool32
+allocateDXT(Raster *raster, int32 dxt, int32 numLevels, bool32 hasAlpha)
+{
+#ifdef RW_D3D12
+	if(raster == nil || raster->platform != PLATFORM_D3D12 ||
+	   raster->type != Raster::TEXTURE || dxt < 1 || dxt > 5)
+		return 0;
+	D3D12Raster *nativeRaster = GETD3D12RASTEREXT(raster);
+	if(nativeRaster->resource != nil)
+		return 0;
+
+	if((raster->format & Raster::MIPMAP) == 0)
+		numLevels = 1;
+	if(numLevels < 1)
+		numLevels = 1;
+	if(numLevels > MAX_MIP_LEVELS)
+		numLevels = MAX_MIP_LEVELS;
+	nativeRaster->numLevels = (uint32)numLevels;
+	nativeRaster->hasAlpha = hasAlpha;
+	if(dxt == 1)
+		nativeRaster->gpuFormat = DXGI_FORMAT_BC1_UNORM;
+	else if(dxt == 2 || dxt == 3)
+		nativeRaster->gpuFormat = DXGI_FORMAT_BC2_UNORM;
+	else
+		nativeRaster->gpuFormat = DXGI_FORMAT_BC3_UNORM;
+
+	if(!createTextureResource(raster, nativeRaster))
+		return 0;
+	const uint32 blockBytes = dxt == 1 ? 8u : 16u;
+	uint32 width = (uint32)raster->width;
+	uint32 height = (uint32)raster->height;
+	for(uint32 level = 0; level < nativeRaster->numLevels; level++){
+		const uint32 blocksWide = width > 4 ? (width + 3)/4 : 1;
+		const uint32 blocksHigh = height > 4 ? (height + 3)/4 : 1;
+		nativeRaster->levelStride[level] = blocksWide*blockBytes;
+		nativeRaster->levelSize[level] =
+			nativeRaster->levelStride[level]*blocksHigh;
+		nativeRaster->backingStore[level] = (uint8*)rwMalloc(
+			nativeRaster->levelSize[level], MEMDUR_EVENT | ID_DRIVER);
+		if(nativeRaster->backingStore[level] == nil)
+			return 0;
+		memset(nativeRaster->backingStore[level], 0,
+		       nativeRaster->levelSize[level]);
+		if(width > 1) width /= 2;
+		if(height > 1) height /= 2;
+	}
+	raster->flags &= ~Raster::DONTALLOCATE;
+	raster->stride = nativeRaster->levelStride[0];
+	raster->originalStride = raster->stride;
+	return 1;
+#else
+	(void)raster;
+	(void)dxt;
+	(void)numLevels;
+	(void)hasAlpha;
+	return 0;
 #endif
 }
 
@@ -837,6 +970,7 @@ createNativeRaster(void *object, int32 offset, int32)
 	raster->srvIndex = UINT32_MAX;
 	raster->rtvIndex = UINT32_MAX;
 	raster->dsvIndex = UINT32_MAX;
+	raster->heapPage = UINT32_MAX;
 #endif
 	return object;
 }
@@ -847,10 +981,15 @@ destroyNativeRaster(void *object, int32 offset, int32)
 #ifdef RW_D3D12
 	D3D12Raster *raster = PLUGINOFFSET(D3D12Raster, object, offset);
 	deferRelease(raster->resource);
+	if(raster->heapPage != UINT32_MAX)
+		deferTextureAllocationRelease(raster->heapPage, raster->heapOffset,
+		                              raster->heapSize);
 	deferDescriptorRelease(raster->srvIndex, raster->rtvIndex,
 	                       raster->dsvIndex);
 	raster->resource = nil;
 	raster->srvIndex = raster->rtvIndex = raster->dsvIndex = UINT32_MAX;
+	raster->heapPage = UINT32_MAX;
+	raster->heapOffset = raster->heapSize = 0;
 	raster->srvCpu.ptr = raster->srvGpu.ptr = 0;
 	raster->rtv.ptr = raster->dsv.ptr = 0;
 	for(uint32 i = 0; i < MAX_MIP_LEVELS; i++){
@@ -872,6 +1011,7 @@ copyNativeRaster(void *dst, void*, int32 offset, int32)
 	raster->srvIndex = UINT32_MAX;
 	raster->rtvIndex = UINT32_MAX;
 	raster->dsvIndex = UINT32_MAX;
+	raster->heapPage = UINT32_MAX;
 #endif
 	return dst;
 }
