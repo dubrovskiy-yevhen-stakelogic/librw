@@ -48,6 +48,8 @@ struct MeshDraw
 	bool32 vertexAlpha;
 };
 
+enum { DYNAMIC_VERTEX_FRAME_COUNT = 3 };
+
 struct D3D12InstanceDataHeader : InstanceDataHeader
 {
 	uint32 serialNumber;
@@ -56,6 +58,7 @@ struct D3D12InstanceDataHeader : InstanceDataHeader
 	uint32 numIndices;
 	D3D12_PRIMITIVE_TOPOLOGY topology;
 	ID3D12Resource *vertexBuffer;
+	ID3D12Resource *vertexBuffers[DYNAMIC_VERTEX_FRAME_COUNT];
 	ID3D12Resource *indexBuffer;
 	D3D12_VERTEX_BUFFER_VIEW vertexView;
 	D3D12_INDEX_BUFFER_VIEW indexView;
@@ -122,6 +125,31 @@ struct LightingConstants
 
 static BoneArena boneArenas[BONE_FRAME_COUNT];
 static uint32 activeBoneArena = UINT32_MAX;
+static WorldRenderProfile worldRenderProfile;
+
+static double
+profileNowMs(void)
+{
+	static LARGE_INTEGER frequency = {};
+	if(frequency.QuadPart == 0)
+		QueryPerformanceFrequency(&frequency);
+	LARGE_INTEGER counter;
+	QueryPerformanceCounter(&counter);
+	return counter.QuadPart*1000.0/frequency.QuadPart;
+}
+
+void
+resetWorldRenderProfile(void)
+{
+	memset(&worldRenderProfile, 0, sizeof(worldRenderProfile));
+}
+
+void
+getWorldRenderProfile(WorldRenderProfile *profile)
+{
+	if(profile)
+		*profile = worldRenderProfile;
+}
 
 template<class T>
 static void
@@ -165,6 +193,7 @@ createUploadBuffer(const void *data, uint64 size, ID3D12Resource **resource)
 	ID3D12Device *device = getDevice();
 	if(device == nil || data == nil || size == 0 || resource == nil)
 		return 0;
+	const double startedMs = profileNowMs();
 	D3D12_HEAP_PROPERTIES props = uploadHeapProperties();
 	D3D12_RESOURCE_DESC desc = bufferDesc(size);
 	if(FAILED(device->CreateCommittedResource(
@@ -180,6 +209,8 @@ createUploadBuffer(const void *data, uint64 size, ID3D12Resource **resource)
 	}
 	memcpy(mapped, data, (size_t)size);
 	(*resource)->Unmap(0, nil);
+	worldRenderProfile.bufferUploadMs += (float32)(profileNowMs()-startedMs);
+	worldRenderProfile.bufferBytes += size;
 	return 1;
 }
 
@@ -557,7 +588,10 @@ freeInstanceData(Geometry *geometry)
 	D3D12InstanceDataHeader *header =
 		(D3D12InstanceDataHeader*)geometry->instData;
 	geometry->instData = nil;
-	deferRelease(header->vertexBuffer);
+	for(uint32 i = 0; i < DYNAMIC_VERTEX_FRAME_COUNT; i++){
+		deferRelease(header->vertexBuffers[i]);
+		header->vertexBuffers[i] = nil;
+	}
 	deferRelease(header->indexBuffer);
 	header->vertexBuffer = nil;
 	header->indexBuffer = nil;
@@ -572,44 +606,11 @@ destroyNativeData(void *object, int32, int32)
 	return object;
 }
 
-static bool32
-instanceGeometry(Geometry *geometry)
+static void
+fillInstanceVertices(Geometry *geometry, Vertex *vertices)
 {
-	if(geometry == nil || geometry->meshHeader == nil ||
-	   geometry->numVertices <= 0 || geometry->morphTargets == nil ||
-	   geometry->morphTargets[0].vertices == nil)
-		return 0;
-	if(geometry->flags & Geometry::NATIVE)
-		return 0;
-
-	if(geometry->instData){
-		D3D12InstanceDataHeader *existing =
-			(D3D12InstanceDataHeader*)geometry->instData;
-		if(existing->platform == PLATFORM_D3D12 &&
-		   existing->serialNumber == geometry->meshHeader->serialNum &&
-		   geometry->lockedSinceInst == 0)
-			return 1;
-		freeInstanceData(geometry);
-	}
-
-	D3D12InstanceDataHeader *header = rwNewT(
-		D3D12InstanceDataHeader, 1, MEMDUR_EVENT | ID_GEOMETRY);
-	memset(header, 0, sizeof(*header));
-	header->platform = PLATFORM_D3D12;
-	header->serialNumber = geometry->meshHeader->serialNum;
-	header->numMeshes = geometry->meshHeader->numMeshes;
-	header->numVertices = geometry->numVertices;
-	header->numIndices = geometry->meshHeader->totalIndices;
-	header->topology = geometry->meshHeader->flags == MeshHeader::TRISTRIP ?
-		D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP :
-		D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-	header->meshes = rwNewT(MeshDraw, header->numMeshes,
-	                            MEMDUR_EVENT | ID_GEOMETRY);
-
-	Vertex *vertices = rwNewT(Vertex, header->numVertices,
-	                          MEMDUR_EVENT | ID_GEOMETRY);
 	Skin *skin = Skin::get(geometry);
-	for(uint32 i = 0; i < header->numVertices; i++){
+	for(uint32 i = 0; i < (uint32)geometry->numVertices; i++){
 		vertices[i].position = geometry->morphTargets[0].vertices[i];
 		if((geometry->flags & Geometry::NORMALS) &&
 		   geometry->morphTargets[0].normals)
@@ -629,8 +630,7 @@ instanceGeometry(Geometry *geometry)
 		vertices[i].weights[0] = 1.0f;
 		vertices[i].weights[1] = vertices[i].weights[2] =
 			vertices[i].weights[3] = 0.0f;
-		memset(vertices[i].boneIndices, 0,
-		       sizeof(vertices[i].boneIndices));
+		memset(vertices[i].boneIndices, 0, sizeof(vertices[i].boneIndices));
 		if(skin && skin->weights && skin->indices){
 			memcpy(vertices[i].weights, skin->weights + i*4,
 			       sizeof(vertices[i].weights));
@@ -638,8 +638,12 @@ instanceGeometry(Geometry *geometry)
 			       sizeof(vertices[i].boneIndices));
 		}
 	}
-	uint16 *indices = rwNewT(uint16, header->numIndices,
-	                         MEMDUR_EVENT | ID_GEOMETRY);
+}
+
+static void
+refreshInstanceMeshes(Geometry *geometry, D3D12InstanceDataHeader *header,
+	                  uint16 *indices)
+{
 	Mesh *mesh = geometry->meshHeader->getMeshes();
 	uint32 indexOffset = 0;
 	for(uint32 i = 0; i < header->numMeshes; i++){
@@ -648,27 +652,113 @@ instanceGeometry(Geometry *geometry)
 		header->meshes[i].material = mesh[i].material;
 		header->meshes[i].vertexAlpha = 0;
 		for(uint32 j = 0; j < mesh[i].numIndices; j++){
-			indices[indexOffset + j] = mesh[i].indices[j];
-			if(geometry->colors &&
-			   geometry->colors[mesh[i].indices[j]].alpha != 0xFF)
+			const uint16 vertex = mesh[i].indices[j];
+			if(indices)
+				indices[indexOffset + j] = vertex;
+			if(geometry->colors && geometry->colors[vertex].alpha != 0xFF)
 				header->meshes[i].vertexAlpha = 1;
 		}
 		indexOffset += mesh[i].numIndices;
 	}
+}
 
+static bool32
+updateDynamicVertices(Geometry *geometry, D3D12InstanceDataHeader *header,
+	                  const Vertex *vertices)
+{
+	const uint32 frame = getFrameIndex() % DYNAMIC_VERTEX_FRAME_COUNT;
+	const uint64 size = header->numVertices*sizeof(Vertex);
+	ID3D12Resource *&buffer = header->vertexBuffers[frame];
+	if(buffer == nil){
+		if(!createUploadBuffer(vertices, size, &buffer))
+			return 0;
+	}else{
+		void *mapped = nil;
+		D3D12_RANGE readRange = { 0, 0 };
+		if(FAILED(buffer->Map(0, &readRange, &mapped)))
+			return 0;
+		memcpy(mapped, vertices, (size_t)size);
+		buffer->Unmap(0, nil);
+	}
+	header->vertexBuffer = buffer;
+	header->vertexView.BufferLocation = buffer->GetGPUVirtualAddress();
+	header->vertexView.SizeInBytes = (UINT)size;
+	header->vertexView.StrideInBytes = sizeof(Vertex);
+	return 1;
+}
+
+static bool32
+instanceGeometry(Geometry *geometry)
+{
+	if(geometry == nil || geometry->meshHeader == nil ||
+	   geometry->numVertices <= 0 || geometry->morphTargets == nil ||
+	   geometry->morphTargets[0].vertices == nil)
+		return 0;
+	if(geometry->flags & Geometry::NATIVE)
+		return 0;
+
+	if(geometry->instData){
+		D3D12InstanceDataHeader *existing =
+			(D3D12InstanceDataHeader*)geometry->instData;
+		if(existing->platform == PLATFORM_D3D12 &&
+		   existing->serialNumber == geometry->meshHeader->serialNum){
+			if(geometry->lockedSinceInst == 0)
+				return 1;
+			const double instanceStartedMs = profileNowMs();
+			Vertex *vertices = rwNewT(Vertex, existing->numVertices,
+			                              MEMDUR_EVENT | ID_GEOMETRY);
+			fillInstanceVertices(geometry, vertices);
+			const bool32 ok = updateDynamicVertices(geometry, existing, vertices);
+			rwFree(vertices);
+			if(!ok)
+				return 0;
+			refreshInstanceMeshes(geometry, existing, nil);
+			geometry->lockedSinceInst = 0;
+			worldRenderProfile.geometryInstanceMs +=
+				(float32)(profileNowMs()-instanceStartedMs);
+			worldRenderProfile.geometryInstances++;
+			return 1;
+		}
+		freeInstanceData(geometry);
+	}
+	const double instanceStartedMs = profileNowMs();
+
+	D3D12InstanceDataHeader *header = rwNewT(
+		D3D12InstanceDataHeader, 1, MEMDUR_EVENT | ID_GEOMETRY);
+	memset(header, 0, sizeof(*header));
+	header->platform = PLATFORM_D3D12;
+	header->serialNumber = geometry->meshHeader->serialNum;
+	header->numMeshes = geometry->meshHeader->numMeshes;
+	header->numVertices = geometry->numVertices;
+	header->numIndices = geometry->meshHeader->totalIndices;
+	header->topology = geometry->meshHeader->flags == MeshHeader::TRISTRIP ?
+		D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP :
+		D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+	header->meshes = rwNewT(MeshDraw, header->numMeshes,
+	                            MEMDUR_EVENT | ID_GEOMETRY);
+
+	Vertex *vertices = rwNewT(Vertex, header->numVertices,
+	                          MEMDUR_EVENT | ID_GEOMETRY);
+	fillInstanceVertices(geometry, vertices);
+	uint16 *indices = rwNewT(uint16, header->numIndices,
+	                         MEMDUR_EVENT | ID_GEOMETRY);
+	refreshInstanceMeshes(geometry, header, indices);
+
+	const uint32 frame = getFrameIndex() % DYNAMIC_VERTEX_FRAME_COUNT;
 	bool32 ok = createUploadBuffer(vertices,
-		header->numVertices*sizeof(Vertex), &header->vertexBuffer) &&
+		header->numVertices*sizeof(Vertex), &header->vertexBuffers[frame]) &&
 		createUploadBuffer(indices,
 		header->numIndices*sizeof(uint16), &header->indexBuffer);
 	rwFree(vertices);
 	rwFree(indices);
 	if(!ok){
-		releaseCom(header->vertexBuffer);
+		releaseCom(header->vertexBuffers[frame]);
 		releaseCom(header->indexBuffer);
 		rwFree(header->meshes);
 		rwFree(header);
 		return 0;
 	}
+	header->vertexBuffer = header->vertexBuffers[frame];
 	header->vertexView.BufferLocation =
 		header->vertexBuffer->GetGPUVirtualAddress();
 	header->vertexView.SizeInBytes = header->numVertices*sizeof(Vertex);
@@ -679,6 +769,9 @@ instanceGeometry(Geometry *geometry)
 	header->indexView.Format = DXGI_FORMAT_R16_UINT;
 	geometry->instData = header;
 	geometry->lockedSinceInst = 0;
+	worldRenderProfile.geometryInstanceMs +=
+		(float32)(profileNowMs()-instanceStartedMs);
+	worldRenderProfile.geometryInstances++;
 	return 1;
 }
 
@@ -965,6 +1058,8 @@ renderGeometry(Atomic *atomic, MeshSelection selection, uint8 fadeAlpha)
 		list->SetGraphicsRootDescriptorTable(4, sampler);
 		list->DrawIndexedInstanced(header->meshes[i].numIndices, 1,
 		                           header->meshes[i].startIndex, 0, 0);
+		worldRenderProfile.drawCalls++;
+		worldRenderProfile.submittedIndices += header->meshes[i].numIndices;
 	}
 	return hasTransparent;
 }

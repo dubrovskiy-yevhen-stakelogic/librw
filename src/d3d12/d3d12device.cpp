@@ -178,6 +178,31 @@ struct D3D12Context
 
 static D3D12Context context;
 static uint32 externalCopyLogCount;
+static FrameSyncProfile frameSyncProfile;
+
+static double
+frameSyncNowMs(void)
+{
+	static LARGE_INTEGER frequency = {};
+	if(frequency.QuadPart == 0)
+		QueryPerformanceFrequency(&frequency);
+	LARGE_INTEGER counter;
+	QueryPerformanceCounter(&counter);
+	return counter.QuadPart * 1000.0 / frequency.QuadPart;
+}
+
+void
+resetFrameSyncProfile(void)
+{
+	memset(&frameSyncProfile, 0, sizeof(frameSyncProfile));
+}
+
+void
+getFrameSyncProfile(FrameSyncProfile *profile)
+{
+	if(profile)
+		*profile = frameSyncProfile;
+}
 
 static UINT64
 alignTextureHeapOffset(UINT64 value, UINT64 alignment)
@@ -1111,7 +1136,10 @@ waitForGpu(void)
 	if(context.fence->GetCompletedValue() < value){
 		if(FAILED(context.fence->SetEventOnCompletion(value, context.fenceEvent)))
 			return 0;
+		const double waitStart = frameSyncNowMs();
 		WaitForSingleObject(context.fenceEvent, INFINITE);
+		frameSyncProfile.fullGpuWaitMs +=
+			(float32)(frameSyncNowMs() - waitStart);
 	}
 	// This signal is ordered after standalone texture-copy command lists.
 	// Their temporary upload resources can now be released safely.
@@ -1127,7 +1155,10 @@ waitForFrame(UINT frameIndex)
 		return 1;
 	if(FAILED(context.fence->SetEventOnCompletion(value, context.fenceEvent)))
 		return 0;
+	const double waitStart = frameSyncNowMs();
 	WaitForSingleObject(context.fenceEvent, INFINITE);
+	frameSyncProfile.frameFenceWaitMs +=
+		(float32)(frameSyncNowMs() - waitStart);
 	return 1;
 }
 
@@ -1639,7 +1670,6 @@ createCoreDevice(void)
 		destroyCoreDevice();
 		return 0;
 	}
-
 	D3D12_COMMAND_QUEUE_DESC queueDesc;
 	memset(&queueDesc, 0, sizeof(queueDesc));
 	queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;

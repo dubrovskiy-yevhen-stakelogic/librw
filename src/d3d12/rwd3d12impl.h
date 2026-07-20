@@ -32,6 +32,32 @@ struct TextureUploadProfile
 void resetTextureUploadProfile(void);
 void getTextureUploadProfile(TextureUploadProfile *profile);
 
+struct FrameSyncProfile
+{
+	float32 frameFenceWaitMs;
+	float32 fullGpuWaitMs;
+};
+
+void resetFrameSyncProfile(void);
+void getFrameSyncProfile(FrameSyncProfile *profile);
+
+// Work that is normally hidden inside the legacy RenderWare atomic callback.
+// In particular, geometry is converted and two upload buffers are allocated
+// the first time a newly streamed model is drawn. That can look like an
+// unexplained eye-render spike unless it is reported separately.
+struct WorldRenderProfile
+{
+	float32 geometryInstanceMs;
+	float32 bufferUploadMs;
+	uint64 bufferBytes;
+	uint64 submittedIndices;
+	uint32 geometryInstances;
+	uint32 drawCalls;
+};
+
+void resetWorldRenderProfile(void);
+void getWorldRenderProfile(WorldRenderProfile *profile);
+
 // Suballocate ordinary sampled textures from large default heaps. Render
 // targets and depth buffers keep their dedicated committed-resource path.
 bool32 allocatePlacedTextureResource(const D3D12_RESOURCE_DESC *desc,
