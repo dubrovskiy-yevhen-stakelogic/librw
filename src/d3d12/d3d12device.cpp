@@ -1409,6 +1409,36 @@ beginFrame(Camera *camera)
 	return 1;
 }
 
+bool32
+setStereoWideViewport(bool32 wide)
+{
+	if(!context.frameOpen || engine == nil || engine->currentCamera == nil)
+		return 0;
+	Raster *frameBuffer = engine->currentCamera->frameBuffer;
+	if(frameBuffer == nil)
+		return 0;
+	Raster *parent = frameBuffer->parent ? frameBuffer->parent : frameBuffer;
+	if(wide && frameBuffer == parent)
+		return 0;
+	D3D12_VIEWPORT viewport;
+	viewport.TopLeftX = wide ? 0.0f : (float)frameBuffer->offsetX;
+	viewport.TopLeftY = wide ? 0.0f : (float)frameBuffer->offsetY;
+	viewport.Width = (float)(wide ? parent->width : frameBuffer->width);
+	viewport.Height = (float)(wide ? parent->height : frameBuffer->height);
+	viewport.MinDepth = 0.0f;
+	viewport.MaxDepth = 1.0f;
+	D3D12_RECT scissor = {
+		(LONG)viewport.TopLeftX, (LONG)viewport.TopLeftY,
+		(LONG)(viewport.TopLeftX + viewport.Width),
+		(LONG)(viewport.TopLeftY + viewport.Height)
+	};
+	context.commandList->RSSetViewports(1, &viewport);
+	context.commandList->RSSetScissorRects(1, &scissor);
+	context.currentTargetWidth = wide ? parent->width : frameBuffer->width;
+	context.currentTargetHeight = wide ? parent->height : frameBuffer->height;
+	return 1;
+}
+
 static void
 beginUpdate(Camera *camera)
 {
@@ -1456,6 +1486,30 @@ clearCamera(Camera *camera, RGBA *color, uint32 mode)
 {
 	if(!beginFrame(camera))
 		return;
+	Raster *frameBuffer = camera ? camera->frameBuffer : nil;
+	Raster *zBuffer = camera ? camera->zBuffer : nil;
+	D3D12_RECT colorRect;
+	D3D12_RECT depthRect;
+	const D3D12_RECT *colorRects = nil;
+	const D3D12_RECT *depthRects = nil;
+	UINT colorRectCount = 0;
+	UINT depthRectCount = 0;
+	if(frameBuffer && frameBuffer != frameBuffer->parent){
+		colorRect.left = frameBuffer->offsetX;
+		colorRect.top = frameBuffer->offsetY;
+		colorRect.right = colorRect.left + frameBuffer->width;
+		colorRect.bottom = colorRect.top + frameBuffer->height;
+		colorRects = &colorRect;
+		colorRectCount = 1;
+	}
+	if(zBuffer && zBuffer != zBuffer->parent){
+		depthRect.left = zBuffer->offsetX;
+		depthRect.top = zBuffer->offsetY;
+		depthRect.right = depthRect.left + zBuffer->width;
+		depthRect.bottom = depthRect.top + zBuffer->height;
+		depthRects = &depthRect;
+		depthRectCount = 1;
+	}
 	if((mode & Camera::CLEARIMAGE) && color){
 		const float clearColor[4] = {
 			color->red / 255.0f,
@@ -1464,13 +1518,13 @@ clearCamera(Camera *camera, RGBA *color, uint32 mode)
 			color->alpha / 255.0f
 		};
 		context.commandList->ClearRenderTargetView(
-			context.currentColorView, clearColor, 0, nil);
+			context.currentColorView, clearColor, colorRectCount, colorRects);
 	}
 	if((mode & Camera::CLEARZ) && context.currentDepthView.ptr)
 		context.commandList->ClearDepthStencilView(
 			context.currentDepthView,
 			D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-			1.0f, 0, 0, nil);
+			1.0f, 0, depthRectCount, depthRects);
 }
 
 static void

@@ -53,10 +53,45 @@ struct WorldRenderProfile
 	uint64 submittedIndices;
 	uint32 geometryInstances;
 	uint32 drawCalls;
+	float32 stereoBundleBuildMs;
+	float32 stereoBundleWaitMs;
+	uint32 stereoBundleDrawCalls;
+	uint32 stereoBundleFallbacks;
 };
 
 void resetWorldRenderProfile(void);
 void getWorldRenderProfile(WorldRenderProfile *profile);
+
+// The two legacy RenderScene passes see the same animated pose and the same
+// world lights.  Let the D3D12 pipeline retain those eye-independent constants
+// after the left eye and reuse them while recording the right eye.
+void setStereoWorldEye(int32 eye);
+// Capture the active eye matrices and temporarily address the complete
+// double-wide OpenXR target.  World geometry can then use one instanced draw
+// to rasterize both eye views while immediate effects keep their sub-viewports.
+void captureStereoWorldCamera(int32 eye);
+bool32 beginStereoSinglePass(void);
+void endStereoSinglePass(void);
+
+// Stage 6 stereo frame packet.  The legacy game builds these heavy world
+// passes while rendering the left eye.  D3D12 stores the fully resolved draw
+// commands (including skinning, lighting and material state), then replays the
+// same immutable commands with the right-eye camera matrices.  Immediate-mode
+// weather, water and screen effects deliberately stay on the original path.
+enum StereoWorldSegment {
+	STEREO_WORLD_ROADS,
+	STEREO_WORLD_ENTITIES,
+	STEREO_WORLD_BOATS,
+	STEREO_WORLD_FADING_UNDERWATER,
+	STEREO_WORLD_FADING,
+	STEREO_WORLD_SEGMENT_COUNT
+};
+void beginStereoWorldCapture(uint32 segment);
+void endStereoWorldCapture(uint32 segment);
+void queueStereoWorldBundleBuild(const float32 *view,
+                                 const float32 *projection);
+bool32 replayStereoWorldSegment(uint32 segment);
+void cancelStereoWorldPacket(void);
 
 // Suballocate ordinary sampled textures from large default heaps. Render
 // targets and depth buffers keep their dedicated committed-resource path.
@@ -122,6 +157,7 @@ bool32 getColorTarget(Raster *raster, ID3D12Resource **resource,
                       D3D12_CPU_DESCRIPTOR_HANDLE *view);
 bool32 getRasterResource(Raster *raster, ID3D12Resource **resource);
 bool32 transitionRaster(Raster *raster, D3D12_RESOURCE_STATES state);
+bool32 setStereoWideViewport(bool32 wide);
 bool32 getTextureView(Raster *raster, D3D12_GPU_DESCRIPTOR_HANDLE *view,
                       bool32 *hasAlpha);
 // Draw a camera texture into an external typeless RGBA8 target while remapping

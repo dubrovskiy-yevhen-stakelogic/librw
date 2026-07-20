@@ -66,6 +66,7 @@ struct D3D12InstanceDataHeader : InstanceDataHeader
 };
 
 static ID3D12RootSignature *rootSignature;
+static ID3D12RootSignature *stereoRootSignature;
 enum WorldBlendMode {
 	WORLD_BLEND_OPAQUE,
 	WORLD_BLEND_ALPHA,
@@ -94,6 +95,7 @@ enum WorldCullMode {
 	WORLD_CULL_COUNT
 };
 static ID3D12PipelineState *worldPipelines[WORLD_BLEND_COUNT][WORLD_DEPTH_COUNT][WORLD_CULL_COUNT];
+static ID3D12PipelineState *stereoWorldPipelines[WORLD_BLEND_COUNT][WORLD_DEPTH_COUNT][WORLD_CULL_COUNT];
 static Raster *whiteRaster;
 static bool32 pipelineReady;
 
@@ -127,6 +129,82 @@ static BoneArena boneArenas[BONE_FRAME_COUNT];
 static uint32 activeBoneArena = UINT32_MAX;
 static WorldRenderProfile worldRenderProfile;
 
+enum { STEREO_ATOMIC_CACHE_COUNT = 8192 };
+
+struct StereoAtomicCacheEntry
+{
+	Atomic *atomic;
+	uint32 generation;
+	D3D12_GPU_VIRTUAL_ADDRESS boneAddress;
+	bool32 isSkinned;
+	LightingConstants lighting;
+};
+
+static StereoAtomicCacheEntry stereoAtomicCache[STEREO_ATOMIC_CACHE_COUNT];
+static uint32 stereoCacheGeneration = 1;
+static int32 stereoWorldEye = -1;
+static bool32 stereoSinglePassActive;
+static uint32 stereoRightCameraFrame = UINT32_MAX;
+static uint32 stereoRightCameraUploadFrame = UINT32_MAX;
+static float stereoRightCameraConstants[32];
+static D3D12_GPU_VIRTUAL_ADDRESS stereoRightCameraAddress;
+
+enum { STEREO_WORLD_DRAW_CAPACITY = 16384 };
+
+struct StereoWorldDraw
+{
+	D3D12_PRIMITIVE_TOPOLOGY topology;
+	D3D12_VERTEX_BUFFER_VIEW vertexView;
+	D3D12_INDEX_BUFFER_VIEW indexView;
+	ID3D12PipelineState *pipeline;
+	D3D12_GPU_VIRTUAL_ADDRESS boneAddress;
+	D3D12_GPU_VIRTUAL_ADDRESS lightingAddress;
+	D3D12_GPU_DESCRIPTOR_HANDLE texture;
+	D3D12_GPU_DESCRIPTOR_HANDLE sampler;
+	float constants[58];
+	uint32 numIndices;
+	uint32 startIndex;
+};
+
+struct StereoWorldRange
+{
+	uint32 first;
+	uint32 count;
+	bool32 complete;
+};
+
+static StereoWorldDraw stereoWorldDraws[STEREO_WORLD_DRAW_CAPACITY];
+static StereoWorldRange stereoWorldRanges[STEREO_WORLD_SEGMENT_COUNT];
+static uint32 stereoWorldDrawCount;
+static int32 stereoCaptureSegment = -1;
+static bool32 stereoWorldPacketValid;
+static uint32 stereoWorldPacketGeneration;
+
+struct StereoBundleFrame
+{
+	ID3D12CommandAllocator *allocator;
+	ID3D12GraphicsCommandList *segments[STEREO_WORLD_SEGMENT_COUNT];
+};
+
+static StereoBundleFrame stereoBundleFrames[BONE_FRAME_COUNT];
+static HANDLE stereoBundleWorkerThread;
+static HANDLE stereoBundleWorkEvent;
+static HANDLE stereoBundleDoneEvent;
+static HANDLE stereoBundleStopEvent;
+static volatile LONG stereoBundlePending;
+static volatile LONG stereoBundleSucceeded;
+static uint32 stereoBundleTaskFrame;
+static uint32 stereoBundleTaskGeneration;
+static float stereoBundleTaskView[16];
+static float stereoBundleTaskProjection[16];
+static uint32 stereoBundleCompletedFrame;
+static uint32 stereoBundleCompletedGeneration;
+static bool32 stereoBundleResourcesReady;
+
+static bool32 waitForStereoWorldBundleBuild(void);
+static bool32 createStereoBundleResources(void);
+static void shutdownStereoBundleResources(void);
+
 static double
 profileNowMs(void)
 {
@@ -151,6 +229,135 @@ getWorldRenderProfile(WorldRenderProfile *profile)
 		*profile = worldRenderProfile;
 }
 
+void
+setStereoWorldEye(int32 eye)
+{
+	if(eye < 0 && stereoSinglePassActive)
+		endStereoSinglePass();
+	if(eye == 0){
+		// A cancelled OpenXR frame may never reach the right-eye replay. Do not
+		// overwrite its packet while the worker still owns it.
+		waitForStereoWorldBundleBuild();
+		stereoCacheGeneration++;
+		if(stereoCacheGeneration == 0){
+			memset(stereoAtomicCache, 0, sizeof(stereoAtomicCache));
+			stereoCacheGeneration = 1;
+		}
+		stereoWorldDrawCount = 0;
+		stereoCaptureSegment = -1;
+		stereoWorldPacketValid = 1;
+		stereoWorldPacketGeneration++;
+		if(stereoWorldPacketGeneration == 0)
+			stereoWorldPacketGeneration = 1;
+		memset(stereoWorldRanges, 0, sizeof(stereoWorldRanges));
+	}
+	stereoWorldEye = eye;
+}
+
+void
+captureStereoWorldCamera(int32 eye)
+{
+	if(eye < 0 || eye > 1 || engine == nil || engine->currentCamera == nil)
+		return;
+	if(eye == 1){
+		memcpy(stereoRightCameraConstants,
+		       &engine->currentCamera->devView, 16*sizeof(float));
+		memcpy(stereoRightCameraConstants + 16,
+		       &engine->currentCamera->devProj, 16*sizeof(float));
+		stereoRightCameraFrame = getFrameIndex() % BONE_FRAME_COUNT;
+		stereoRightCameraUploadFrame = UINT32_MAX;
+		stereoRightCameraAddress = 0;
+	}
+}
+
+void
+beginStereoWorldCapture(uint32 segment)
+{
+	if(stereoWorldEye != 0 || !stereoWorldPacketValid ||
+	   segment >= STEREO_WORLD_SEGMENT_COUNT){
+		stereoCaptureSegment = -1;
+		return;
+	}
+	StereoWorldRange &range = stereoWorldRanges[segment];
+	range.first = stereoWorldDrawCount;
+	range.count = 0;
+	range.complete = 0;
+	stereoCaptureSegment = (int32)segment;
+}
+
+void
+endStereoWorldCapture(uint32 segment)
+{
+	if(stereoCaptureSegment != (int32)segment ||
+	   segment >= STEREO_WORLD_SEGMENT_COUNT){
+		stereoCaptureSegment = -1;
+		return;
+	}
+	StereoWorldRange &range = stereoWorldRanges[segment];
+	range.count = stereoWorldDrawCount - range.first;
+	range.complete = stereoWorldPacketValid;
+	stereoCaptureSegment = -1;
+}
+
+void
+cancelStereoWorldPacket(void)
+{
+	waitForStereoWorldBundleBuild();
+	stereoCaptureSegment = -1;
+	stereoWorldPacketValid = 0;
+	memset(stereoWorldRanges, 0, sizeof(stereoWorldRanges));
+}
+
+void
+queueStereoWorldBundleBuild(const float32 *view, const float32 *projection)
+{
+	if(!stereoBundleResourcesReady || stereoWorldEye != 0 ||
+	   view == nil || projection == nil ||
+	   !stereoWorldPacketValid || stereoBundleWorkEvent == nil)
+		return;
+	for(uint32 segment = 0; segment < STEREO_WORLD_SEGMENT_COUNT; segment++)
+		if(!stereoWorldRanges[segment].complete)
+			return;
+	waitForStereoWorldBundleBuild();
+	stereoBundleTaskFrame = getFrameIndex() % BONE_FRAME_COUNT;
+	stereoBundleTaskGeneration = stereoWorldPacketGeneration;
+	memcpy(stereoBundleTaskView, view,
+	       sizeof(stereoBundleTaskView));
+	memcpy(stereoBundleTaskProjection, projection,
+	       sizeof(stereoBundleTaskProjection));
+	InterlockedExchange(&stereoBundleSucceeded, 0);
+	InterlockedExchange(&stereoBundlePending, 1);
+	ResetEvent(stereoBundleDoneEvent);
+	if(!SetEvent(stereoBundleWorkEvent)){
+		InterlockedExchange(&stereoBundlePending, 0);
+		SetEvent(stereoBundleDoneEvent);
+	}
+}
+
+static StereoAtomicCacheEntry*
+findStereoAtomicCache(Atomic *atomic, bool32 create)
+{
+	if(atomic == nil || stereoWorldEye < 0)
+		return nil;
+	const uintptr_t key = (uintptr_t)atomic;
+	uint32 slot = (uint32)(((key >> 4) * 2654435761u) &
+	                       (STEREO_ATOMIC_CACHE_COUNT - 1));
+	for(uint32 probe = 0; probe < STEREO_ATOMIC_CACHE_COUNT; probe++){
+		StereoAtomicCacheEntry *entry =
+			&stereoAtomicCache[(slot + probe) & (STEREO_ATOMIC_CACHE_COUNT - 1)];
+		if(entry->generation != stereoCacheGeneration){
+			if(!create)
+				return nil;
+			entry->generation = stereoCacheGeneration;
+			entry->atomic = atomic;
+			return entry;
+		}
+		if(entry->atomic == atomic)
+			return entry;
+	}
+	return nil;
+}
+
 template<class T>
 static void
 releaseCom(T *&object)
@@ -159,6 +366,165 @@ releaseCom(T *&object)
 		object->Release();
 		object = nil;
 	}
+}
+
+static bool32
+recordStereoWorldBundles(uint32 frame)
+{
+	if(frame >= BONE_FRAME_COUNT || !stereoWorldPacketValid)
+		return 0;
+	StereoBundleFrame &bundleFrame = stereoBundleFrames[frame];
+	if(bundleFrame.allocator == nil ||
+	   FAILED(bundleFrame.allocator->Reset()))
+		return 0;
+	ID3D12DescriptorHeap *heaps[2] = {
+		getShaderResourceHeap(), getSamplerHeap()
+	};
+	if(heaps[0] == nil || heaps[1] == nil)
+		return 0;
+	for(uint32 segment = 0; segment < STEREO_WORLD_SEGMENT_COUNT; segment++){
+		const StereoWorldRange &range = stereoWorldRanges[segment];
+		ID3D12GraphicsCommandList *list = bundleFrame.segments[segment];
+		if(list == nil || !range.complete ||
+		   range.first + range.count > stereoWorldDrawCount ||
+		   FAILED(list->Reset(bundleFrame.allocator, nil)))
+			return 0;
+		list->SetDescriptorHeaps(2, heaps);
+		list->SetGraphicsRootSignature(rootSignature);
+		for(uint32 i = 0; i < range.count; i++){
+			const StereoWorldDraw &draw = stereoWorldDraws[range.first + i];
+			float constants[58];
+			memcpy(constants, draw.constants, sizeof(constants));
+			memcpy(constants + 16, stereoBundleTaskView,
+			       sizeof(stereoBundleTaskView));
+			memcpy(constants + 32, stereoBundleTaskProjection,
+			       sizeof(stereoBundleTaskProjection));
+			list->IASetPrimitiveTopology(draw.topology);
+			list->IASetVertexBuffers(0, 1, &draw.vertexView);
+			list->IASetIndexBuffer(&draw.indexView);
+			list->SetPipelineState(draw.pipeline);
+			list->SetGraphicsRoot32BitConstants(0, 58, constants, 0);
+			list->SetGraphicsRootDescriptorTable(1, draw.texture);
+			list->SetGraphicsRootConstantBufferView(2, draw.boneAddress);
+			list->SetGraphicsRootConstantBufferView(3, draw.lightingAddress);
+			list->SetGraphicsRootDescriptorTable(4, draw.sampler);
+			list->DrawIndexedInstanced(draw.numIndices, 1,
+			                           draw.startIndex, 0, 0);
+		}
+		if(FAILED(list->Close()))
+			return 0;
+	}
+	return 1;
+}
+
+static DWORD WINAPI
+stereoBundleWorkerProc(void*)
+{
+	HANDLE events[2] = { stereoBundleStopEvent, stereoBundleWorkEvent };
+	for(;;){
+		DWORD result = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+		if(result == WAIT_OBJECT_0)
+			break;
+		if(result != WAIT_OBJECT_0 + 1)
+			continue;
+		const uint32 frame = stereoBundleTaskFrame;
+		const uint32 generation = stereoBundleTaskGeneration;
+		const double start = profileNowMs();
+		const bool32 ok = recordStereoWorldBundles(frame);
+		worldRenderProfile.stereoBundleBuildMs +=
+			(float32)(profileNowMs() - start);
+		stereoBundleCompletedFrame = frame;
+		stereoBundleCompletedGeneration = generation;
+		InterlockedExchange(&stereoBundleSucceeded, ok ? 1 : 0);
+		SetEvent(stereoBundleDoneEvent);
+	}
+	return 0;
+}
+
+static bool32
+waitForStereoWorldBundleBuild(void)
+{
+	if(InterlockedCompareExchange(&stereoBundlePending, 0, 0) == 0)
+		return 0;
+	if(stereoBundleDoneEvent == nil){
+		InterlockedExchange(&stereoBundlePending, 0);
+		return 0;
+	}
+	const double start = profileNowMs();
+	const DWORD result = WaitForSingleObject(stereoBundleDoneEvent, INFINITE);
+	worldRenderProfile.stereoBundleWaitMs +=
+		(float32)(profileNowMs() - start);
+	InterlockedExchange(&stereoBundlePending, 0);
+	return result == WAIT_OBJECT_0 &&
+	       InterlockedCompareExchange(&stereoBundleSucceeded, 0, 0) != 0;
+}
+
+static void
+shutdownStereoBundleResources(void)
+{
+	if(stereoBundleWorkerThread){
+		if(stereoBundleStopEvent)
+			SetEvent(stereoBundleStopEvent);
+		WaitForSingleObject(stereoBundleWorkerThread, INFINITE);
+		CloseHandle(stereoBundleWorkerThread);
+		stereoBundleWorkerThread = nil;
+	}
+	if(stereoBundleWorkEvent){ CloseHandle(stereoBundleWorkEvent); stereoBundleWorkEvent = nil; }
+	if(stereoBundleDoneEvent){ CloseHandle(stereoBundleDoneEvent); stereoBundleDoneEvent = nil; }
+	if(stereoBundleStopEvent){ CloseHandle(stereoBundleStopEvent); stereoBundleStopEvent = nil; }
+	for(uint32 frame = 0; frame < BONE_FRAME_COUNT; frame++){
+		for(uint32 segment = 0; segment < STEREO_WORLD_SEGMENT_COUNT; segment++)
+			releaseCom(stereoBundleFrames[frame].segments[segment]);
+		releaseCom(stereoBundleFrames[frame].allocator);
+	}
+	InterlockedExchange(&stereoBundlePending, 0);
+	InterlockedExchange(&stereoBundleSucceeded, 0);
+	stereoBundleResourcesReady = 0;
+}
+
+static bool32
+createStereoBundleResources(void)
+{
+	if(stereoBundleResourcesReady)
+		return 1;
+	ID3D12Device *device = getDevice();
+	if(device == nil)
+		return 0;
+	for(uint32 frame = 0; frame < BONE_FRAME_COUNT; frame++){
+		if(FAILED(device->CreateCommandAllocator(
+		       D3D12_COMMAND_LIST_TYPE_BUNDLE,
+		       IID_PPV_ARGS(&stereoBundleFrames[frame].allocator)))){
+			shutdownStereoBundleResources();
+			return 0;
+		}
+		for(uint32 segment = 0; segment < STEREO_WORLD_SEGMENT_COUNT; segment++){
+			ID3D12GraphicsCommandList *&list =
+				stereoBundleFrames[frame].segments[segment];
+			if(FAILED(device->CreateCommandList(
+			       0, D3D12_COMMAND_LIST_TYPE_BUNDLE,
+			       stereoBundleFrames[frame].allocator, nil,
+			       IID_PPV_ARGS(&list))) || FAILED(list->Close())){
+				shutdownStereoBundleResources();
+				return 0;
+			}
+		}
+	}
+	stereoBundleWorkEvent = CreateEventA(nil, FALSE, FALSE, nil);
+	stereoBundleDoneEvent = CreateEventA(nil, TRUE, TRUE, nil);
+	stereoBundleStopEvent = CreateEventA(nil, TRUE, FALSE, nil);
+	if(stereoBundleWorkEvent == nil || stereoBundleDoneEvent == nil ||
+	   stereoBundleStopEvent == nil){
+		shutdownStereoBundleResources();
+		return 0;
+	}
+	stereoBundleWorkerThread = CreateThread(
+		nil, 0, stereoBundleWorkerProc, nil, 0, nil);
+	if(stereoBundleWorkerThread == nil){
+		shutdownStereoBundleResources();
+		return 0;
+	}
+	stereoBundleResourcesReady = 1;
+	return 1;
 }
 
 static D3D12_HEAP_PROPERTIES
@@ -216,7 +582,7 @@ createUploadBuffer(const void *data, uint64 size, ID3D12Resource **resource)
 
 static bool32
 compileShader(const char *source, const char *entry, const char *target,
-	          ID3DBlob **shader)
+	          ID3DBlob **shader, const D3D_SHADER_MACRO *defines = nil)
 {
 	ID3DBlob *errors = nil;
 	UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
@@ -226,7 +592,7 @@ compileShader(const char *source, const char *entry, const char *target,
 	flags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
 #endif
 	HRESULT hr = D3DCompile(source, strlen(source), "librw_d3d12_default",
-	                        nil, nil, entry, target, flags, 0, shader, &errors);
+	                        defines, nil, entry, target, flags, 0, shader, &errors);
 	if(FAILED(hr) && errors)
 		fprintf(stderr, "librw D3D12 shader: %s\n",
 		        (const char*)errors->GetBufferPointer());
@@ -397,11 +763,50 @@ createPipelineResources(void)
 	if(FAILED(hr))
 		return 0;
 
+	// The stereo shader receives the ordinary per-draw block through a CBV
+	// instead of 58 root constants. That leaves ample root-signature space for
+	// the right-eye camera while preserving all material/bone/light bindings.
+	D3D12_ROOT_PARAMETER stereoParams[6];
+	memset(stereoParams, 0, sizeof(stereoParams));
+	stereoParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+	stereoParams[0].Descriptor.ShaderRegister = 0;
+	stereoParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+	for(uint32 i = 1; i < 5; i++)
+		stereoParams[i] = params[i];
+	stereoParams[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+	stereoParams[5].Descriptor.ShaderRegister = 3;
+	stereoParams[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+	signature.NumParameters = 6;
+	signature.pParameters = stereoParams;
+	serialized = nil;
+	errors = nil;
+	hr = D3D12SerializeRootSignature(
+		&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors);
+	if(FAILED(hr)){
+		if(errors)
+			fprintf(stderr, "librw D3D12 stereo root signature: %s\n",
+			        (const char*)errors->GetBufferPointer());
+		releaseCom(errors);
+		releaseCom(serialized);
+		return 0;
+	}
+	releaseCom(errors);
+	hr = device->CreateRootSignature(
+		0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+		IID_PPV_ARGS(&stereoRootSignature));
+	releaseCom(serialized);
+	if(FAILED(hr))
+		return 0;
+
 	static const char *shaderSource =
 		"cbuffer DrawConstants : register(b0) {"
 		" row_major float4x4 world; row_major float4x4 view;"
 		" row_major float4x4 projection; float4 materialColor; float4 drawFlags;"
-		" float fogEnd; float fogRange; };"
+		" float fogEnd; float fogRange; };\n"
+		"#ifdef STEREO_VERTEX\n"
+		"cbuffer RightCameraConstants : register(b3) {"
+		" row_major float4x4 rightView; row_major float4x4 rightProjection; };\n"
+		"#endif\n"
 		"cbuffer SkinConstants : register(b1) { row_major float4x4 bones[64]; };"
 		"cbuffer LightingConstants : register(b2) { float4 ambientLight;"
 		" float4 surfaceProps; float4 lightColorRadius[8];"
@@ -412,8 +817,12 @@ createPipelineResources(void)
 		" float4 color : COLOR0; float2 uv : TEXCOORD0;"
 		" float4 weights : BLENDWEIGHT0; uint4 indices : BLENDINDICES0; };"
 		"struct VSOut { float4 position : SV_POSITION; float4 color : COLOR0;"
-		" float2 uv : TEXCOORD0; float fogFactor : TEXCOORD1; };"
-		"VSOut VSMain(VSIn input) { VSOut output;"
+		" float2 uv : TEXCOORD0; float fogFactor : TEXCOORD1;\n"
+		"#ifdef STEREO_VERTEX\n"
+		" float2 clipDistance : SV_ClipDistance0;\n"
+		"#endif\n"
+		"};"
+		"VSOut BuildVS(VSIn input, uint stereoEye) { VSOut output;"
 		" float4 localPosition = float4(input.position, 1.0);"
 		" float3 localNormal = input.normal;"
 		" if(drawFlags.y > 0.5) { localPosition = float4(0.0, 0.0, 0.0, 0.0);"
@@ -422,7 +831,11 @@ createPipelineResources(void)
 		" { localPosition += mul(float4(input.position, 1.0), bones[input.indices[i]]) * input.weights[i];"
 		" localNormal += mul(float4(input.normal, 0.0), bones[input.indices[i]]).xyz * input.weights[i]; } }"
 		" float4 worldPosition = mul(localPosition, world);"
-		" float4 p = mul(worldPosition, view); output.position = mul(p, projection);"
+		" float4 p = mul(worldPosition, view); output.position = mul(p, projection);\n"
+		"#ifdef STEREO_VERTEX\n"
+		" if(stereoEye != 0) { p = mul(worldPosition, rightView);"
+		" output.position = mul(p, rightProjection); }\n"
+		"#endif\n"
 		" output.fogFactor = fogRange < 0.0 ?"
 		" saturate((p.z - fogEnd) * fogRange) : 1.0;"
 		" float3 normal = normalize(mul(float4(localNormal, 0.0), world).xyz);"
@@ -451,6 +864,16 @@ createPipelineResources(void)
 		" }"
 		" output.color = float4(saturate(litColor), input.color.a) * materialColor; output.uv = input.uv;"
 		" return output; }"
+		"VSOut VSMain(VSIn input) { return BuildVS(input, 0); }\n"
+		"#ifdef STEREO_VERTEX\n"
+		"VSOut VSMainStereo(VSIn input, uint instanceId : SV_InstanceID) {"
+		" VSOut output = BuildVS(input, instanceId);"
+		" output.clipDistance = float2(output.position.x + output.position.w,"
+		"  output.position.w - output.position.x);"
+		" output.position.x = output.position.x * 0.5 +"
+		"  (instanceId == 0 ? -0.5 : 0.5) * output.position.w;"
+		" return output; }\n"
+		"#endif\n"
 		"float4 PSMain(VSOut input) : SV_TARGET {"
 		" float4 color = input.color;"
 		" if(drawFlags.x > 0.5) color *= diffuseTexture.Sample(diffuseSampler, input.uv);"
@@ -462,10 +885,17 @@ createPipelineResources(void)
 		" color.rgb = lerp(fogColor, color.rgb, input.fogFactor);"
 		" return color; }";
 	ID3DBlob *vertexShader = nil;
+	ID3DBlob *stereoVertexShader = nil;
 	ID3DBlob *pixelShader = nil;
+	const D3D_SHADER_MACRO stereoDefines[] = {
+		{ "STEREO_VERTEX", "1" }, { nil, nil }
+	};
 	if(!compileShader(shaderSource, "VSMain", "vs_5_0", &vertexShader) ||
+	   !compileShader(shaderSource, "VSMainStereo", "vs_5_0", &stereoVertexShader,
+	                  stereoDefines) ||
 	   !compileShader(shaderSource, "PSMain", "ps_5_0", &pixelShader)){
 		releaseCom(vertexShader);
+		releaseCom(stereoVertexShader);
 		releaseCom(pixelShader);
 		return 0;
 	}
@@ -537,18 +967,34 @@ createPipelineResources(void)
 				pso.RasterizerState.CullMode = cull == WORLD_CULL_BACK ?
 					D3D12_CULL_MODE_BACK : cull == WORLD_CULL_FRONT ?
 					D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_NONE;
+				pso.pRootSignature = rootSignature;
+				pso.VS.pShaderBytecode = vertexShader->GetBufferPointer();
+				pso.VS.BytecodeLength = vertexShader->GetBufferSize();
 				hr = device->CreateGraphicsPipelineState(
 					&pso, IID_PPV_ARGS(&worldPipelines[blend][depth][cull]));
+				if(SUCCEEDED(hr)){
+					pso.pRootSignature = stereoRootSignature;
+					pso.VS.pShaderBytecode = stereoVertexShader->GetBufferPointer();
+					pso.VS.BytecodeLength = stereoVertexShader->GetBufferSize();
+					hr = device->CreateGraphicsPipelineState(
+						&pso, IID_PPV_ARGS(&stereoWorldPipelines[blend][depth][cull]));
+				}
 			}
 		}
 	}
 	releaseCom(vertexShader);
+	releaseCom(stereoVertexShader);
 	releaseCom(pixelShader);
 	if(FAILED(hr)){
 		for(uint32 blend = 0; blend < WORLD_BLEND_COUNT; blend++)
 			for(uint32 depth = 0; depth < WORLD_DEPTH_COUNT; depth++)
 				for(uint32 cull = 0; cull < WORLD_CULL_COUNT; cull++)
+				{
 					releaseCom(worldPipelines[blend][depth][cull]);
+					releaseCom(stereoWorldPipelines[blend][depth][cull]);
+				}
+		releaseCom(stereoRootSignature);
+		releaseCom(rootSignature);
 		return 0;
 	}
 
@@ -575,6 +1021,11 @@ createPipelineResources(void)
 	white->destroy();
 	if(whiteRaster == nil)
 		return 0;
+	// The Stage 6 bundle worker experiment is intentionally disabled. Profiling
+	// on the target Quest/D3D12 driver showed that command recording contended
+	// with the main thread and added about one millisecond of synchronization.
+	// Keep the proven direct immutable-packet replay until true single-pass
+	// stereo replaces the second world submission.
 	pipelineReady = 1;
 	return 1;
 }
@@ -789,7 +1240,7 @@ fillMatrix(float *dst, const Matrix *matrix)
 }
 
 static bool32
-allocateBoneConstants(const float *matrices,
+allocateArenaConstants(const void *data, uint32 dataSize,
 	                  D3D12_GPU_VIRTUAL_ADDRESS *address)
 {
 	uint32 frame = getFrameIndex() % BONE_FRAME_COUNT;
@@ -799,34 +1250,58 @@ allocateBoneConstants(const float *matrices,
 	}
 	BoneArena &arena = boneArenas[frame];
 	uint32 offset = (arena.offset + 255u) & ~255u;
-	uint32 size = MAX_SKIN_BONES*16*sizeof(float);
-	if(arena.mapped == nil || offset + size > BONE_UPLOAD_SIZE)
+	uint32 size = (dataSize + 255u) & ~255u;
+	if(data == nil || address == nil || arena.mapped == nil ||
+	   offset + size > BONE_UPLOAD_SIZE)
 		return 0;
-	memcpy(arena.mapped + offset, matrices, size);
+	memset(arena.mapped + offset, 0, size);
+	memcpy(arena.mapped + offset, data, dataSize);
 	*address = arena.resource->GetGPUVirtualAddress() + offset;
 	arena.offset = offset + size;
 	return 1;
+}
+
+bool32
+beginStereoSinglePass(void)
+{
+	const uint32 frame = getFrameIndex() % BONE_FRAME_COUNT;
+	if(!pipelineReady || stereoSinglePassActive || stereoWorldEye != 0 ||
+	   stereoRightCameraFrame != frame)
+		return 0;
+	if(stereoRightCameraUploadFrame != frame || stereoRightCameraAddress == 0){
+		if(!allocateArenaConstants(stereoRightCameraConstants,
+		       sizeof(stereoRightCameraConstants), &stereoRightCameraAddress))
+			return 0;
+		stereoRightCameraUploadFrame = frame;
+	}
+	if(!setStereoWideViewport(1))
+		return 0;
+	stereoSinglePassActive = 1;
+	return 1;
+}
+
+void
+endStereoSinglePass(void)
+{
+	if(!stereoSinglePassActive)
+		return;
+	stereoSinglePassActive = 0;
+	setStereoWideViewport(0);
+}
+
+static bool32
+allocateBoneConstants(const float *matrices,
+	                  D3D12_GPU_VIRTUAL_ADDRESS *address)
+{
+	return allocateArenaConstants(matrices,
+	       MAX_SKIN_BONES*16*sizeof(float), address);
 }
 
 static bool32
 allocateLightingConstants(const LightingConstants *constants,
 	                     D3D12_GPU_VIRTUAL_ADDRESS *address)
 {
-	uint32 frame = getFrameIndex() % BONE_FRAME_COUNT;
-	if(activeBoneArena != frame){
-		activeBoneArena = frame;
-		boneArenas[frame].offset = 0;
-	}
-	BoneArena &arena = boneArenas[frame];
-	uint32 offset = (arena.offset + 255u) & ~255u;
-	const uint32 size = (sizeof(*constants) + 255u) & ~255u;
-	if(arena.mapped == nil || offset + size > BONE_UPLOAD_SIZE)
-		return 0;
-	memset(arena.mapped + offset, 0, size);
-	memcpy(arena.mapped + offset, constants, sizeof(*constants));
-	*address = arena.resource->GetGPUVirtualAddress() + offset;
-	arena.offset = offset + size;
-	return 1;
+	return allocateArenaConstants(constants, sizeof(*constants), address);
 }
 
 static void
@@ -965,7 +1440,11 @@ renderGeometry(Atomic *atomic, MeshSelection selection, uint8 fadeAlpha)
 		return 0;
 	D3D12InstanceDataHeader *header =
 		(D3D12InstanceDataHeader*)atomic->geometry->instData;
-	list->SetGraphicsRootSignature(rootSignature);
+	const bool32 stereoDraw = stereoSinglePassActive &&
+		stereoRightCameraAddress != 0;
+	list->SetGraphicsRootSignature(stereoDraw ? stereoRootSignature : rootSignature);
+	if(stereoDraw)
+		list->SetGraphicsRootConstantBufferView(5, stereoRightCameraAddress);
 	list->IASetPrimitiveTopology(header->topology);
 	list->IASetVertexBuffers(0, 1, &header->vertexView);
 	list->IASetIndexBuffer(&header->indexView);
@@ -977,8 +1456,28 @@ renderGeometry(Atomic *atomic, MeshSelection selection, uint8 fadeAlpha)
 	memcpy(constants + 32, &camera->devProj, 16*sizeof(float));
 	D3D12_GPU_VIRTUAL_ADDRESS boneAddress;
 	bool32 isSkinned;
-	if(!uploadSkinMatrices(atomic, &boneAddress, &isSkinned))
-		return 0;
+	LightingConstants lighting;
+	StereoAtomicCacheEntry *cached = findStereoAtomicCache(atomic, 0);
+	if(cached){
+		boneAddress = cached->boneAddress;
+		isSkinned = cached->isSkinned;
+		lighting = cached->lighting;
+	}else{
+		if(!uploadSkinMatrices(atomic, &boneAddress, &isSkinned))
+			return 0;
+		collectLighting(atomic, &lighting);
+		// Only the left eye populates the cache.  A right-eye-only edge object
+		// simply follows the normal path instead of contaminating this frame's
+		// left-eye snapshot.
+		if(stereoWorldEye == 0){
+			StereoAtomicCacheEntry *entry = findStereoAtomicCache(atomic, 1);
+			if(entry){
+				entry->boneAddress = boneAddress;
+				entry->isSkinned = isSkinned;
+				entry->lighting = lighting;
+			}
+		}
+	}
 	constants[53] = isSkinned ? 1.0f : 0.0f;
 	constants[54] = (uint32)(uintptr_t)getRenderState(ALPHATESTREF)/255.0f;
 	constants[55] = (float)(uint32)(uintptr_t)getRenderState(ALPHATESTFUNC);
@@ -991,8 +1490,6 @@ renderGeometry(Atomic *atomic, MeshSelection selection, uint8 fadeAlpha)
 	}
 	uint32 packedFog = (uint32)(uintptr_t)getRenderState(FOGCOLOR);
 	list->SetGraphicsRootConstantBufferView(2, boneAddress);
-	LightingConstants lighting;
-	collectLighting(atomic, &lighting);
 	D3D12_GPU_DESCRIPTOR_HANDLE fallback;
 	getTextureView(whiteRaster, &fallback, nil);
 	bool32 hasTransparent = 0;
@@ -1051,17 +1548,105 @@ renderGeometry(Atomic *atomic, MeshSelection selection, uint8 fadeAlpha)
 		uint32 cullState = (uint32)(uintptr_t)getRenderState(CULLMODE);
 		uint32 cull = cullState == CULLBACK ? WORLD_CULL_BACK :
 			cullState == CULLFRONT ? WORLD_CULL_FRONT : WORLD_CULL_NONE;
-		list->SetPipelineState(worldPipelines[blend][depth][cull]);
+		ID3D12PipelineState *pipeline = stereoDraw ?
+			stereoWorldPipelines[blend][depth][cull] :
+			worldPipelines[blend][depth][cull];
+		list->SetPipelineState(pipeline);
 		constants[52] = textured ? 1.0f : 0.0f;
-		list->SetGraphicsRoot32BitConstants(0, 58, constants, 0);
+		if(stereoDraw){
+			D3D12_GPU_VIRTUAL_ADDRESS drawAddress;
+			if(!allocateArenaConstants(constants, sizeof(constants), &drawAddress))
+				return hasTransparent;
+			list->SetGraphicsRootConstantBufferView(0, drawAddress);
+		}else
+			list->SetGraphicsRoot32BitConstants(0, 58, constants, 0);
 		list->SetGraphicsRootDescriptorTable(1, texture);
 		list->SetGraphicsRootDescriptorTable(4, sampler);
-		list->DrawIndexedInstanced(header->meshes[i].numIndices, 1,
+		list->DrawIndexedInstanced(header->meshes[i].numIndices,
+		                           stereoDraw ? 2 : 1,
 		                           header->meshes[i].startIndex, 0, 0);
+		if(stereoCaptureSegment >= 0 && stereoWorldPacketValid){
+			if(stereoWorldDrawCount < STEREO_WORLD_DRAW_CAPACITY){
+				StereoWorldDraw &draw = stereoWorldDraws[stereoWorldDrawCount++];
+				draw.topology = header->topology;
+				draw.vertexView = header->vertexView;
+				draw.indexView = header->indexView;
+				draw.pipeline = pipeline;
+				draw.boneAddress = boneAddress;
+				draw.lightingAddress = lightingAddress;
+				draw.texture = texture;
+				draw.sampler = sampler;
+				memcpy(draw.constants, constants, sizeof(draw.constants));
+				draw.numIndices = header->meshes[i].numIndices;
+				draw.startIndex = header->meshes[i].startIndex;
+			}else{
+				// Never replay a truncated world. The right eye will use the
+				// original renderer for every segment when this safety limit is hit.
+				stereoWorldPacketValid = 0;
+			}
+		}
 		worldRenderProfile.drawCalls++;
-		worldRenderProfile.submittedIndices += header->meshes[i].numIndices;
+		worldRenderProfile.submittedIndices += header->meshes[i].numIndices *
+			(stereoDraw ? 2 : 1);
 	}
 	return hasTransparent;
+}
+
+bool32
+replayStereoWorldSegment(uint32 segment)
+{
+	if(stereoWorldEye != 1 || !stereoWorldPacketValid ||
+	   segment >= STEREO_WORLD_SEGMENT_COUNT || !pipelineReady)
+		return 0;
+	const StereoWorldRange &range = stereoWorldRanges[segment];
+	if(!range.complete || range.first + range.count > stereoWorldDrawCount)
+		return 0;
+	ID3D12GraphicsCommandList *list = getCommandList();
+	Camera *camera = engine->currentCamera;
+	if(list == nil || camera == nil)
+		return 0;
+
+	list->SetGraphicsRootSignature(rootSignature);
+	if(InterlockedCompareExchange(&stereoBundlePending, 0, 0) != 0)
+		waitForStereoWorldBundleBuild();
+	const uint32 frame = getFrameIndex() % BONE_FRAME_COUNT;
+	const bool32 bundleReady = stereoBundleResourcesReady &&
+		InterlockedCompareExchange(&stereoBundleSucceeded, 0, 0) != 0 &&
+		stereoBundleCompletedGeneration == stereoWorldPacketGeneration &&
+		stereoBundleCompletedFrame == frame &&
+		stereoBundleFrames[frame].segments[segment] != nil;
+	if(bundleReady){
+		list->ExecuteBundle(stereoBundleFrames[frame].segments[segment]);
+		worldRenderProfile.drawCalls += range.count;
+		worldRenderProfile.stereoBundleDrawCalls += range.count;
+		for(uint32 i = 0; i < range.count; i++)
+			worldRenderProfile.submittedIndices +=
+				stereoWorldDraws[range.first + i].numIndices;
+		return 1;
+	}
+	if(stereoBundleResourcesReady)
+		worldRenderProfile.stereoBundleFallbacks++;
+	for(uint32 i = 0; i < range.count; i++){
+		const StereoWorldDraw &draw = stereoWorldDraws[range.first + i];
+		float constants[58];
+		memcpy(constants, draw.constants, sizeof(constants));
+		memcpy(constants + 16, &camera->devView, 16*sizeof(float));
+		memcpy(constants + 32, &camera->devProj, 16*sizeof(float));
+		list->IASetPrimitiveTopology(draw.topology);
+		list->IASetVertexBuffers(0, 1, &draw.vertexView);
+		list->IASetIndexBuffer(&draw.indexView);
+		list->SetPipelineState(draw.pipeline);
+		list->SetGraphicsRoot32BitConstants(0, 58, constants, 0);
+		list->SetGraphicsRootDescriptorTable(1, draw.texture);
+		list->SetGraphicsRootConstantBufferView(2, draw.boneAddress);
+		list->SetGraphicsRootConstantBufferView(3, draw.lightingAddress);
+		list->SetGraphicsRootDescriptorTable(4, draw.sampler);
+		list->DrawIndexedInstanced(draw.numIndices, 1,
+		                           draw.startIndex, 0, 0);
+		worldRenderProfile.drawCalls++;
+		worldRenderProfile.submittedIndices += draw.numIndices;
+	}
+	return 1;
 }
 
 bool32
@@ -1121,6 +1706,7 @@ shutdownDefaultPipeline(void)
 {
 #ifdef RW_D3D12
 	pipelineReady = 0;
+	shutdownStereoBundleResources();
 	if(whiteRaster){
 		whiteRaster->destroy();
 		whiteRaster = nil;
@@ -1136,7 +1722,15 @@ shutdownDefaultPipeline(void)
 	for(uint32 blend = 0; blend < WORLD_BLEND_COUNT; blend++)
 		for(uint32 depth = 0; depth < WORLD_DEPTH_COUNT; depth++)
 			for(uint32 cull = 0; cull < WORLD_CULL_COUNT; cull++)
+			{
 				releaseCom(worldPipelines[blend][depth][cull]);
+				releaseCom(stereoWorldPipelines[blend][depth][cull]);
+			}
+	stereoSinglePassActive = 0;
+	stereoRightCameraFrame = UINT32_MAX;
+	stereoRightCameraUploadFrame = UINT32_MAX;
+	stereoRightCameraAddress = 0;
+	releaseCom(stereoRootSignature);
 	releaseCom(rootSignature);
 #endif
 }

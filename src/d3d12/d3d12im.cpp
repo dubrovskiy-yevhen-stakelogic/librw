@@ -1398,6 +1398,21 @@ resolveRasterToExternal(Raster *source, ID3D12Resource *destination,
 	   destination == nil || width <= 0 || height <= 0 ||
 	   blurColor == nil || contrastMult == nil || contrastAdd == nil)
 		return 0;
+	Raster *sourceParent = source->parent ? source->parent : source;
+	if(sourceParent->width <= 0 || sourceParent->height <= 0 ||
+	   source->width <= 0 || source->height <= 0)
+		return 0;
+	// The source may be one eye inside a shared double-wide render target.
+	// Compose the eye-local OpenXR UV remap with that sub-rectangle before the
+	// shader samples the parent SRV.
+	const float32 regionScaleX = (float32)source->width/(float32)sourceParent->width;
+	const float32 regionScaleY = (float32)source->height/(float32)sourceParent->height;
+	const float32 regionOffsetX = (float32)source->offsetX/(float32)sourceParent->width;
+	const float32 regionOffsetY = (float32)source->offsetY/(float32)sourceParent->height;
+	uvScaleX *= regionScaleX;
+	uvScaleY *= regionScaleY;
+	uvOffsetX = regionOffsetX + uvOffsetX*regionScaleX;
+	uvOffsetY = regionOffsetY + uvOffsetY*regionScaleY;
 	ID3D12Device *device = getDevice();
 	ID3D12GraphicsCommandList *list = getCommandList();
 	if(device == nil || list == nil)
@@ -1452,8 +1467,8 @@ resolveRasterToExternal(Raster *source, ID3D12Resource *destination,
 	constants.uvScale[1] = uvScaleY;
 	constants.uvOffset[0] = uvOffsetX;
 	constants.uvOffset[1] = uvOffsetY;
-	constants.inverseSourceSize[0] = 1.0f/(float)source->width;
-	constants.inverseSourceSize[1] = 1.0f/(float)source->height;
+	constants.inverseSourceSize[0] = 1.0f/(float)sourceParent->width;
+	constants.inverseSourceSize[1] = 1.0f/(float)sourceParent->height;
 	constants.fxaaEnabled = fxaaEnabled != 0;
 	constants.colorMode = colorMode;
 	memcpy(constants.blurColor, blurColor, sizeof(constants.blurColor));
