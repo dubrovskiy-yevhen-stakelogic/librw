@@ -61,6 +61,8 @@ struct WorldRenderProfile
 	uint32 stereoSinglePassDrawCalls;
 	uint64 stereoSinglePassIndices;
 	uint32 stereoSinglePassFallbacks;
+	uint32 fixedFoveatedBegins;
+	uint32 fixedFoveatedFailures;
 };
 
 void resetWorldRenderProfile(void);
@@ -76,6 +78,36 @@ void setStereoWorldEye(int32 eye);
 void captureStereoWorldCamera(int32 eye);
 bool32 beginStereoSinglePass(void);
 void endStereoSinglePass(void);
+
+// Tier 2 D3D12 variable-rate shading profile used by the double-wide OpenXR
+// world pass.  Profile zero disables it; the other profiles progressively
+// reduce the full-rate central region while retaining an automatic 1x1
+// fallback on GPUs without a shading-rate image.
+enum FixedFoveatedProfile {
+	FIXED_FOVEATED_OFF,
+	FIXED_FOVEATED_QUALITY,
+	FIXED_FOVEATED_BALANCED,
+	FIXED_FOVEATED_PERFORMANCE,
+	FIXED_FOVEATED_PROFILE_COUNT
+};
+
+struct FixedFoveatedRenderingInfo
+{
+	bool32 supported;
+	bool32 enabled;
+	bool32 active;
+	bool32 additionalRates;
+	uint32 tier;
+	uint32 tileSize;
+	uint32 profile;
+	uint32 imageWidth;
+	uint32 imageHeight;
+};
+
+void setFixedFoveatedRenderingProfile(uint32 profile);
+void getFixedFoveatedRenderingInfo(FixedFoveatedRenderingInfo *info);
+bool32 beginFixedFoveatedRendering(void);
+void endFixedFoveatedRendering(void);
 
 // Stage 6 stereo frame packet.  The legacy game builds these heavy world
 // passes while rendering the left eye.  D3D12 stores the fully resolved draw

@@ -129,6 +129,7 @@ struct D3D12Context
 	ID3D12Resource *backBuffers[FRAME_COUNT];
 	ID3D12CommandAllocator *commandAllocators[FRAME_COUNT];
 	ID3D12GraphicsCommandList *commandList;
+	ID3D12GraphicsCommandList5 *commandList5;
 	D3D12_CPU_DESCRIPTOR_HANDLE rtvHandles[FRAME_COUNT];
 	HANDLE fenceEvent;
 	UINT64 fenceValue;
@@ -162,6 +163,18 @@ struct D3D12Context
 	ID3D12Resource *currentColorResource;
 	D3D12_CPU_DESCRIPTOR_HANDLE currentColorView;
 	D3D12_CPU_DESCRIPTOR_HANDLE currentDepthView;
+	ID3D12Resource *fixedFoveatedImage;
+	uint32 fixedFoveatedTier;
+	uint32 fixedFoveatedTileSize;
+	uint32 fixedFoveatedProfile;
+	uint32 fixedFoveatedImageProfile;
+	uint32 fixedFoveatedImageWidth;
+	uint32 fixedFoveatedImageHeight;
+	int32 fixedFoveatedTargetWidth;
+	int32 fixedFoveatedTargetHeight;
+	bool32 fixedFoveatedAdditionalRates;
+	bool32 fixedFoveatedActive;
+	bool32 fixedFoveatedCreationFailed;
 	std::vector<IUnknown*> deferredReleases[FRAME_COUNT];
 	std::vector<IUnknown*> pendingSubmitReleases;
 	std::vector<PendingTextureUpload> pendingTextureUploads;
@@ -1173,6 +1186,8 @@ destroyFrameResources(void)
 	context.currentDepthView.ptr = 0;
 	context.currentTargetWidth = 0;
 	context.currentTargetHeight = 0;
+	context.fixedFoveatedActive = 0;
+	releaseCom(context.commandList5);
 	releaseCom(context.commandList);
 	for(uint32 i = 0; i < FRAME_COUNT; i++){
 		releaseCom(context.commandAllocators[i]);
@@ -1249,6 +1264,7 @@ createFrameResources(void)
 	        context.commandAllocators[0], nil,
 	        IID_PPV_ARGS(&context.commandList))))
 		return 0;
+	context.commandList->QueryInterface(IID_PPV_ARGS(&context.commandList5));
 	if(FAILED(context.commandList->Close()))
 		return 0;
 
@@ -1333,6 +1349,245 @@ transitionBarrier(ID3D12Resource *resource, D3D12_RESOURCE_STATES before,
 	return barrier;
 }
 
+void
+setFixedFoveatedRenderingProfile(uint32 profile)
+{
+	if(profile >= FIXED_FOVEATED_PROFILE_COUNT)
+		profile = FIXED_FOVEATED_OFF;
+	if(context.fixedFoveatedProfile == profile)
+		return;
+
+	if(context.fixedFoveatedActive)
+		endFixedFoveatedRendering();
+	context.fixedFoveatedProfile = profile;
+	context.fixedFoveatedCreationFailed = 0;
+
+	// OFF keeps the last map resident so comparison toggles are free. A change
+	// between quality profiles needs a new immutable image; retain the old one
+	// until the next submitted frame fence makes its GPU references safe.
+	if(profile != FIXED_FOVEATED_OFF && context.fixedFoveatedImage &&
+	   context.fixedFoveatedImageProfile != profile){
+		deferReleaseAfterNextSubmit(context.fixedFoveatedImage);
+		context.fixedFoveatedImage = nil;
+		context.fixedFoveatedImageWidth = 0;
+		context.fixedFoveatedImageHeight = 0;
+		context.fixedFoveatedTargetWidth = 0;
+		context.fixedFoveatedTargetHeight = 0;
+	}
+}
+
+void
+getFixedFoveatedRenderingInfo(FixedFoveatedRenderingInfo *info)
+{
+	if(info == nil)
+		return;
+	memset(info, 0, sizeof(*info));
+	info->supported = context.fixedFoveatedTier >=
+		D3D12_VARIABLE_SHADING_RATE_TIER_2 &&
+		context.fixedFoveatedTileSize != 0 && context.commandList5 != nil;
+	info->enabled = context.fixedFoveatedProfile != FIXED_FOVEATED_OFF;
+	info->active = context.fixedFoveatedActive;
+	info->additionalRates = context.fixedFoveatedAdditionalRates;
+	info->tier = context.fixedFoveatedTier;
+	info->tileSize = context.fixedFoveatedTileSize;
+	info->profile = context.fixedFoveatedProfile;
+	info->imageWidth = context.fixedFoveatedImageWidth;
+	info->imageHeight = context.fixedFoveatedImageHeight;
+}
+
+static uint8
+fixedFoveatedRateForTile(uint32 tileX, uint32 tileY, int32 targetWidth,
+	                    int32 targetHeight)
+{
+	const uint32 tileSize = context.fixedFoveatedTileSize;
+	const float32 eyeWidth = targetWidth*0.5f;
+	const float32 halfEyeWidth = eyeWidth*0.5f;
+	const float32 halfHeight = targetHeight*0.5f;
+	float32 pixelX = (tileX + 0.5f)*tileSize;
+	float32 pixelY = (tileY + 0.5f)*tileSize;
+	if(pixelX > targetWidth-0.5f)
+		pixelX = targetWidth-0.5f;
+	if(pixelY > targetHeight-0.5f)
+		pixelY = targetHeight-0.5f;
+	const uint32 eye = pixelX >= eyeWidth ? 1u : 0u;
+	const float32 eyeCentreX = eye*eyeWidth + halfEyeWidth;
+	const float32 nx = (pixelX-eyeCentreX)/halfEyeWidth;
+	const float32 ny = (pixelY-halfHeight)/halfHeight;
+	const float32 radiusSquared = nx*nx + ny*ny;
+
+	float32 innerRadius = 0.75f;
+	float32 middleRadius = 1.15f;
+	if(context.fixedFoveatedProfile == FIXED_FOVEATED_BALANCED){
+		innerRadius = 0.65f;
+		middleRadius = 1.00f;
+	}else if(context.fixedFoveatedProfile == FIXED_FOVEATED_PERFORMANCE){
+		innerRadius = 0.55f;
+		middleRadius = 0.85f;
+	}
+	if(radiusSquared <= innerRadius*innerRadius)
+		return (uint8)D3D12_SHADING_RATE_1X1;
+	if(radiusSquared <= middleRadius*middleRadius)
+		return (uint8)D3D12_SHADING_RATE_2X2;
+	return (uint8)(context.fixedFoveatedAdditionalRates ?
+		D3D12_SHADING_RATE_4X4 : D3D12_SHADING_RATE_2X2);
+}
+
+static bool32
+createFixedFoveatedImage(int32 targetWidth, int32 targetHeight)
+{
+	if(context.device == nil || context.commandList == nil ||
+	   context.fixedFoveatedTileSize == 0 || targetWidth < 2 ||
+	   targetHeight < 1 || (targetWidth & 1) != 0)
+		return 0;
+
+	const uint32 tileSize = context.fixedFoveatedTileSize;
+	const uint32 imageWidth = (targetWidth + tileSize-1)/tileSize;
+	const uint32 imageHeight = (targetHeight + tileSize-1)/tileSize;
+	if(context.fixedFoveatedImage &&
+	   context.fixedFoveatedImageProfile == context.fixedFoveatedProfile &&
+	   context.fixedFoveatedTargetWidth == targetWidth &&
+	   context.fixedFoveatedTargetHeight == targetHeight)
+		return 1;
+	if(context.fixedFoveatedCreationFailed)
+		return 0;
+
+	if(context.fixedFoveatedImage){
+		deferReleaseAfterNextSubmit(context.fixedFoveatedImage);
+		context.fixedFoveatedImage = nil;
+	}
+
+	D3D12_RESOURCE_DESC textureDesc;
+	memset(&textureDesc, 0, sizeof(textureDesc));
+	textureDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	textureDesc.Width = imageWidth;
+	textureDesc.Height = imageHeight;
+	textureDesc.DepthOrArraySize = 1;
+	textureDesc.MipLevels = 1;
+	textureDesc.Format = DXGI_FORMAT_R8_UINT;
+	textureDesc.SampleDesc.Count = 1;
+	textureDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+	D3D12_HEAP_PROPERTIES defaultHeap;
+	memset(&defaultHeap, 0, sizeof(defaultHeap));
+	defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+	defaultHeap.CreationNodeMask = 1;
+	defaultHeap.VisibleNodeMask = 1;
+	ID3D12Resource *image = nil;
+	if(FAILED(context.device->CreateCommittedResource(
+	       &defaultHeap, D3D12_HEAP_FLAG_NONE, &textureDesc,
+	       D3D12_RESOURCE_STATE_COPY_DEST, nil, IID_PPV_ARGS(&image)))){
+		context.fixedFoveatedCreationFailed = 1;
+		return 0;
+	}
+
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+	UINT rows = 0;
+	UINT64 rowSize = 0;
+	UINT64 uploadSize = 0;
+	context.device->GetCopyableFootprints(&textureDesc, 0, 1, 0,
+		&footprint, &rows, &rowSize, &uploadSize);
+	D3D12_RESOURCE_DESC uploadDesc;
+	memset(&uploadDesc, 0, sizeof(uploadDesc));
+	uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	uploadDesc.Width = uploadSize;
+	uploadDesc.Height = 1;
+	uploadDesc.DepthOrArraySize = 1;
+	uploadDesc.MipLevels = 1;
+	uploadDesc.SampleDesc.Count = 1;
+	uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	D3D12_HEAP_PROPERTIES uploadHeap;
+	memset(&uploadHeap, 0, sizeof(uploadHeap));
+	uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+	uploadHeap.CreationNodeMask = 1;
+	uploadHeap.VisibleNodeMask = 1;
+	ID3D12Resource *upload = nil;
+	if(FAILED(context.device->CreateCommittedResource(
+	       &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+	       D3D12_RESOURCE_STATE_GENERIC_READ, nil, IID_PPV_ARGS(&upload)))){
+		releaseCom(image);
+		context.fixedFoveatedCreationFailed = 1;
+		return 0;
+	}
+
+	uint8 *mapped = nil;
+	D3D12_RANGE readRange = { 0, 0 };
+	if(FAILED(upload->Map(0, &readRange, (void**)&mapped))){
+		releaseCom(upload);
+		releaseCom(image);
+		context.fixedFoveatedCreationFailed = 1;
+		return 0;
+	}
+	memset(mapped, 0, (size_t)uploadSize);
+	for(uint32 y = 0; y < imageHeight; y++){
+		uint8 *row = mapped + footprint.Offset +
+			y*footprint.Footprint.RowPitch;
+		for(uint32 x = 0; x < imageWidth; x++)
+			row[x] = fixedFoveatedRateForTile(x, y,
+				targetWidth, targetHeight);
+	}
+	D3D12_RANGE writtenRange = { 0, (SIZE_T)uploadSize };
+	upload->Unmap(0, &writtenRange);
+
+	D3D12_TEXTURE_COPY_LOCATION destination;
+	memset(&destination, 0, sizeof(destination));
+	destination.pResource = image;
+	destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	D3D12_TEXTURE_COPY_LOCATION source;
+	memset(&source, 0, sizeof(source));
+	source.pResource = upload;
+	source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	source.PlacedFootprint = footprint;
+	context.commandList->CopyTextureRegion(&destination, 0, 0, 0, &source, nil);
+	D3D12_RESOURCE_BARRIER barrier = transitionBarrier(image,
+		D3D12_RESOURCE_STATE_COPY_DEST,
+		D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE);
+	context.commandList->ResourceBarrier(1, &barrier);
+	deferRelease(upload);
+
+	context.fixedFoveatedImage = image;
+	context.fixedFoveatedImageProfile = context.fixedFoveatedProfile;
+	context.fixedFoveatedImageWidth = imageWidth;
+	context.fixedFoveatedImageHeight = imageHeight;
+	context.fixedFoveatedTargetWidth = targetWidth;
+	context.fixedFoveatedTargetHeight = targetHeight;
+	return 1;
+}
+
+bool32
+beginFixedFoveatedRendering(void)
+{
+	FixedFoveatedRenderingInfo info;
+	getFixedFoveatedRenderingInfo(&info);
+	if(!info.supported || !info.enabled || !context.frameOpen)
+		return 0;
+	if(context.fixedFoveatedActive)
+		return 1;
+	if(!createFixedFoveatedImage(context.currentTargetWidth,
+	   context.currentTargetHeight))
+		return 0;
+
+	D3D12_SHADING_RATE_COMBINER combiners[2] = {
+		D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+		D3D12_SHADING_RATE_COMBINER_OVERRIDE
+	};
+	context.commandList5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, combiners);
+	context.commandList5->RSSetShadingRateImage(context.fixedFoveatedImage);
+	context.fixedFoveatedActive = 1;
+	return 1;
+}
+
+void
+endFixedFoveatedRendering(void)
+{
+	if(!context.fixedFoveatedActive)
+		return;
+	if(context.commandList5 && context.frameOpen){
+		context.commandList5->RSSetShadingRateImage(nil);
+		context.commandList5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, nil);
+	}
+	context.fixedFoveatedActive = 0;
+}
+
 static bool32
 beginFrame(Camera *camera)
 {
@@ -1347,6 +1602,7 @@ beginFrame(Camera *camera)
 		   FAILED(context.commandList->Reset(
 		       context.commandAllocators[context.frameIndex], nil)))
 			return 0;
+		context.fixedFoveatedActive = 0;
 
 		D3D12_RESOURCE_BARRIER barrier = transitionBarrier(
 			context.backBuffers[context.frameIndex],
@@ -1539,6 +1795,7 @@ finishFrame(void)
 {
 	if(!context.frameOpen)
 		return;
+	endFixedFoveatedRendering();
 	if(context.currentColorRaster)
 		transitionRaster(context.currentColorRaster,
 		                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -1662,6 +1919,14 @@ destroyCoreDevice(void)
 	for(size_t i = 0; i < context.pendingTextureAllocations.size(); i++)
 		freeTextureAllocationNow(context.pendingTextureAllocations[i]);
 	context.pendingTextureAllocations.clear();
+	releaseCom(context.fixedFoveatedImage);
+	context.fixedFoveatedImageWidth = 0;
+	context.fixedFoveatedImageHeight = 0;
+	context.fixedFoveatedTargetWidth = 0;
+	context.fixedFoveatedTargetHeight = 0;
+	context.fixedFoveatedImageProfile = FIXED_FOVEATED_OFF;
+	context.fixedFoveatedActive = 0;
+	context.fixedFoveatedCreationFailed = 0;
 	destroyFrameResources();
 	for(size_t i = 0; i < context.textureHeapPages.size(); i++)
 		releaseCom(context.textureHeapPages[i].heap);
@@ -1684,6 +1949,9 @@ destroyCoreDevice(void)
 	context.srvDescriptorSize = 0;
 	context.samplerDescriptorSize = 0;
 	context.dsvDescriptorSize = 0;
+	context.fixedFoveatedTier = D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
+	context.fixedFoveatedTileSize = 0;
+	context.fixedFoveatedAdditionalRates = 0;
 	context.nextSrvDescriptor = 0;
 	context.nextSamplerDescriptor = 0;
 	context.nextDsvDescriptor = 0;
@@ -1723,6 +1991,15 @@ createCoreDevice(void)
 	if(!selectAdapter()){
 		destroyCoreDevice();
 		return 0;
+	}
+	D3D12_FEATURE_DATA_D3D12_OPTIONS6 options6;
+	memset(&options6, 0, sizeof(options6));
+	if(SUCCEEDED(context.device->CheckFeatureSupport(
+	       D3D12_FEATURE_D3D12_OPTIONS6, &options6, sizeof(options6)))){
+		context.fixedFoveatedTier = options6.VariableShadingRateTier;
+		context.fixedFoveatedTileSize = options6.ShadingRateImageTileSize;
+		context.fixedFoveatedAdditionalRates =
+			options6.AdditionalShadingRatesSupported != FALSE;
 	}
 	D3D12_COMMAND_QUEUE_DESC queueDesc;
 	memset(&queueDesc, 0, sizeof(queueDesc));

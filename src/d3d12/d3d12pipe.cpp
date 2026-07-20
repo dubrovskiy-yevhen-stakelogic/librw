@@ -1284,6 +1284,14 @@ beginStereoSinglePass(void)
 	}
 	stereoSinglePassActive = 1;
 	worldRenderProfile.stereoSinglePassBegins++;
+	FixedFoveatedRenderingInfo foveatedInfo;
+	getFixedFoveatedRenderingInfo(&foveatedInfo);
+	if(foveatedInfo.supported && foveatedInfo.enabled){
+		if(beginFixedFoveatedRendering())
+			worldRenderProfile.fixedFoveatedBegins++;
+		else
+			worldRenderProfile.fixedFoveatedFailures++;
+	}
 	return 1;
 }
 
@@ -1292,6 +1300,7 @@ endStereoSinglePass(void)
 {
 	if(!stereoSinglePassActive)
 		return;
+	endFixedFoveatedRendering();
 	stereoSinglePassActive = 0;
 	setStereoWideViewport(0);
 }
