@@ -1266,17 +1266,24 @@ beginStereoSinglePass(void)
 {
 	const uint32 frame = getFrameIndex() % BONE_FRAME_COUNT;
 	if(!pipelineReady || stereoSinglePassActive || stereoWorldEye != 0 ||
-	   stereoRightCameraFrame != frame)
+	   stereoRightCameraFrame != frame){
+		worldRenderProfile.stereoSinglePassFallbacks++;
 		return 0;
+	}
 	if(stereoRightCameraUploadFrame != frame || stereoRightCameraAddress == 0){
 		if(!allocateArenaConstants(stereoRightCameraConstants,
-		       sizeof(stereoRightCameraConstants), &stereoRightCameraAddress))
+		       sizeof(stereoRightCameraConstants), &stereoRightCameraAddress)){
+			worldRenderProfile.stereoSinglePassFallbacks++;
 			return 0;
+		}
 		stereoRightCameraUploadFrame = frame;
 	}
-	if(!setStereoWideViewport(1))
+	if(!setStereoWideViewport(1)){
+		worldRenderProfile.stereoSinglePassFallbacks++;
 		return 0;
+	}
 	stereoSinglePassActive = 1;
+	worldRenderProfile.stereoSinglePassBegins++;
 	return 1;
 }
 
@@ -1588,6 +1595,11 @@ renderGeometry(Atomic *atomic, MeshSelection selection, uint8 fadeAlpha)
 		worldRenderProfile.drawCalls++;
 		worldRenderProfile.submittedIndices += header->meshes[i].numIndices *
 			(stereoDraw ? 2 : 1);
+		if(stereoDraw){
+			worldRenderProfile.stereoSinglePassDrawCalls++;
+			worldRenderProfile.stereoSinglePassIndices +=
+				header->meshes[i].numIndices * 2;
+		}
 	}
 	return hasTransparent;
 }

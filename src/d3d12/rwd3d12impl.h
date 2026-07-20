@@ -57,6 +57,10 @@ struct WorldRenderProfile
 	float32 stereoBundleWaitMs;
 	uint32 stereoBundleDrawCalls;
 	uint32 stereoBundleFallbacks;
+	uint32 stereoSinglePassBegins;
+	uint32 stereoSinglePassDrawCalls;
+	uint64 stereoSinglePassIndices;
+	uint32 stereoSinglePassFallbacks;
 };
 
 void resetWorldRenderProfile(void);
