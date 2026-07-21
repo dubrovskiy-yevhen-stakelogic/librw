@@ -148,6 +148,8 @@ static uint32 stereoRightCameraFrame = UINT32_MAX;
 static uint32 stereoRightCameraUploadFrame = UINT32_MAX;
 static float stereoRightCameraConstants[32];
 static D3D12_GPU_VIRTUAL_ADDRESS stereoRightCameraAddress;
+static float stereoTemporalCameraConstants[2][32];
+static bool32 stereoTemporalCameraValid[2];
 
 enum { STEREO_WORLD_DRAW_CAPACITY = 16384 };
 
@@ -250,15 +252,27 @@ setStereoWorldEye(int32 eye)
 		if(stereoWorldPacketGeneration == 0)
 			stereoWorldPacketGeneration = 1;
 		memset(stereoWorldRanges, 0, sizeof(stereoWorldRanges));
+		stereoTemporalCameraValid[0] = 0;
+		stereoTemporalCameraValid[1] = 0;
 	}
 	stereoWorldEye = eye;
 }
 
 void
-captureStereoWorldCamera(int32 eye)
+captureStereoWorldCamera(int32 eye, float32 jitterClipX, float32 jitterClipY)
 {
 	if(eye < 0 || eye > 1 || engine == nil || engine->currentCamera == nil)
 		return;
+	// Streamline consumes non-jittered camera matrices. Capture them before
+	// applying the sub-pixel offset used by the actual DLAA render.
+	memcpy(stereoTemporalCameraConstants[eye],
+	       &engine->currentCamera->devView, 16*sizeof(float));
+	memcpy(stereoTemporalCameraConstants[eye] + 16,
+	       &engine->currentCamera->devProj, 16*sizeof(float));
+	stereoTemporalCameraValid[eye] = 1;
+	float *projection = (float*)&engine->currentCamera->devProj;
+	projection[8] += jitterClipX;
+	projection[9] += jitterClipY;
 	if(eye == 1){
 		memcpy(stereoRightCameraConstants,
 		       &engine->currentCamera->devView, 16*sizeof(float));
@@ -268,6 +282,17 @@ captureStereoWorldCamera(int32 eye)
 		stereoRightCameraUploadFrame = UINT32_MAX;
 		stereoRightCameraAddress = 0;
 	}
+}
+
+bool32
+getStereoWorldCamera(int32 eye, float32 view[16], float32 projection[16])
+{
+	if(eye < 0 || eye > 1 || view == nil || projection == nil ||
+	   !stereoTemporalCameraValid[eye])
+		return 0;
+	memcpy(view, stereoTemporalCameraConstants[eye], 16*sizeof(float));
+	memcpy(projection, stereoTemporalCameraConstants[eye] + 16, 16*sizeof(float));
+	return 1;
 }
 
 void
@@ -1751,6 +1776,8 @@ shutdownDefaultPipeline(void)
 	stereoRightCameraFrame = UINT32_MAX;
 	stereoRightCameraUploadFrame = UINT32_MAX;
 	stereoRightCameraAddress = 0;
+	stereoTemporalCameraValid[0] = 0;
+	stereoTemporalCameraValid[1] = 0;
 	releaseCom(stereoRootSignature);
 	releaseCom(rootSignature);
 #endif

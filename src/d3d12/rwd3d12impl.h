@@ -75,7 +75,8 @@ void setStereoWorldEye(int32 eye);
 // Capture the active eye matrices and temporarily address the complete
 // double-wide OpenXR target.  World geometry can then use one instanced draw
 // to rasterize both eye views while immediate effects keep their sub-viewports.
-void captureStereoWorldCamera(int32 eye);
+void captureStereoWorldCamera(int32 eye, float32 jitterClipX, float32 jitterClipY);
+bool32 getStereoWorldCamera(int32 eye, float32 view[16], float32 projection[16]);
 bool32 beginStereoSinglePass(void);
 void endStereoSinglePass(void);
 
@@ -140,6 +141,11 @@ void deferTextureAllocationRelease(uint32 heapPage, uint64 heapOffset,
                                    uint64 heapSize);
 
 ID3D12Device *getDevice(void);
+// Streamline has to receive the final D3D12 device before librw creates the
+// command queue and swap chain.  The game registers this callback before RW
+// initialization so renderer-independent builds keep no Streamline dependency.
+typedef void (*DeviceCreatedCallback)(void);
+void setDeviceCreatedCallback(DeviceCreatedCallback callback);
 ID3D12CommandQueue *getCommandQueue(void);
 ID3D12GraphicsCommandList *getCommandList(void);
 ID3D12DescriptorHeap *getShaderResourceHeap(void);
@@ -189,6 +195,11 @@ void deferDescriptorRelease(uint32 srvIndex, uint32 rtvIndex,
 
 bool32 getDepthTarget(Raster *raster, ID3D12Resource **resource,
                       D3D12_CPU_DESCRIPTOR_HANDLE *view);
+// The D24S8 depth allocation is typeless internally so temporal passes can
+// sample its depth plane through an R24_UNORM_X8_TYPELESS SRV.
+bool32 transitionDepthRaster(Raster *raster, D3D12_RESOURCE_STATES state);
+bool32 getDepthTextureView(Raster *raster, ID3D12Resource **resource,
+                           D3D12_GPU_DESCRIPTOR_HANDLE *view);
 bool32 getColorTarget(Raster *raster, ID3D12Resource **resource,
                       D3D12_CPU_DESCRIPTOR_HANDLE *view);
 bool32 getRasterResource(Raster *raster, ID3D12Resource **resource);
@@ -207,6 +218,20 @@ bool32 resolveRasterToExternal(Raster *source, ID3D12Resource *destination,
                                const float32 blurColor[4],
                                const float32 contrastMult[3],
                                const float32 contrastAdd[3]);
+// Resolve a native shader-readable texture into an OpenXR swapchain image.
+// DLAA owns the source resource and descriptor, so unlike the raster version
+// this function does not perform a source state transition.
+bool32 resolveTextureToExternal(ID3D12Resource *source,
+                                D3D12_GPU_DESCRIPTOR_HANDLE sourceView,
+                                ID3D12Resource *destination,
+                                int32 sourceWidth, int32 sourceHeight,
+                                int32 width, int32 height,
+                                float32 uvScaleX, float32 uvScaleY,
+                                float32 uvOffsetX, float32 uvOffsetY,
+                                bool32 fxaaEnabled, uint32 colorMode,
+                                const float32 blurColor[4],
+                                const float32 contrastMult[3],
+                                const float32 contrastAdd[3]);
 
 bool32 initializeImmediate(void);
 void shutdownImmediate(void);

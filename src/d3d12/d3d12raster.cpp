@@ -242,8 +242,12 @@ createDepthResource(Raster *raster, D3D12Raster *nativeRaster)
 	if(device == nil)
 		return 0;
 
+	// DLAA/TAA needs to sample the same depth that the legacy RenderWare
+	// passes write.  Allocate a typeless resource and expose compatible DSV
+	// and SRV views instead of maintaining a second, potentially divergent,
+	// depth copy.
 	D3D12_RESOURCE_DESC desc = textureDesc(
-		raster->width, raster->height, 1, DXGI_FORMAT_D24_UNORM_S8_UINT,
+		raster->width, raster->height, 1, DXGI_FORMAT_R24G8_TYPELESS,
 		D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
 	D3D12_CLEAR_VALUE clearValue;
 	memset(&clearValue, 0, sizeof(clearValue));
@@ -260,8 +264,25 @@ createDepthResource(Raster *raster, D3D12Raster *nativeRaster)
 	if(!allocateDepthDescriptor(&nativeRaster->dsv,
 	                          &nativeRaster->dsvIndex))
 		return 0;
-	device->CreateDepthStencilView(nativeRaster->resource, nil,
+	D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc;
+	memset(&dsvDesc, 0, sizeof(dsvDesc));
+	dsvDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+	dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+	device->CreateDepthStencilView(nativeRaster->resource, &dsvDesc,
 	                               nativeRaster->dsv);
+	if(!allocateShaderResourceDescriptor(&nativeRaster->srvCpu,
+	                                     &nativeRaster->srvGpu,
+	                                     &nativeRaster->srvIndex))
+		return 0;
+	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc;
+	memset(&srvDesc, 0, sizeof(srvDesc));
+	srvDesc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+	srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srvDesc.Texture2D.MipLevels = 1;
+	device->CreateShaderResourceView(nativeRaster->resource, &srvDesc,
+	                                 nativeRaster->srvCpu);
+	nativeRaster->gpuFormat = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
 	raster->format = Raster::D24;
 	raster->depth = 24;
 	return 1;
@@ -860,6 +881,29 @@ rasterToImage(Raster *raster)
 
 #ifdef RW_D3D12
 bool32
+transitionDepthRaster(Raster *raster, D3D12_RESOURCE_STATES state)
+{
+	if(raster)
+		raster = raster->parent;
+	if(raster == nil || raster->platform != PLATFORM_D3D12 ||
+	   raster->type != Raster::ZBUFFER)
+		return 0;
+	D3D12Raster *nativeRaster = GETD3D12RASTEREXT(raster);
+	if(nativeRaster->resource == nil)
+		return 0;
+	if(nativeRaster->state == state)
+		return 1;
+	ID3D12GraphicsCommandList *list = getCommandList();
+	if(list == nil)
+		return 0;
+	D3D12_RESOURCE_BARRIER barrier = transitionBarrier(
+		nativeRaster->resource, nativeRaster->state, state);
+	list->ResourceBarrier(1, &barrier);
+	nativeRaster->state = state;
+	return 1;
+}
+
+bool32
 getDepthTarget(Raster *raster, ID3D12Resource **resource,
 	           D3D12_CPU_DESCRIPTOR_HANDLE *view)
 {
@@ -871,8 +915,32 @@ getDepthTarget(Raster *raster, ID3D12Resource **resource,
 	D3D12Raster *nativeRaster = GETD3D12RASTEREXT(raster);
 	if(nativeRaster->resource == nil || nativeRaster->dsv.ptr == 0)
 		return 0;
+	if(!transitionDepthRaster(raster, D3D12_RESOURCE_STATE_DEPTH_WRITE))
+		return 0;
 	if(resource) *resource = nativeRaster->resource;
 	if(view) *view = nativeRaster->dsv;
+	return 1;
+}
+
+bool32
+getDepthTextureView(Raster *raster, ID3D12Resource **resource,
+	                D3D12_GPU_DESCRIPTOR_HANDLE *view)
+{
+	if(raster)
+		raster = raster->parent;
+	if(raster == nil || raster->platform != PLATFORM_D3D12 ||
+	   raster->type != Raster::ZBUFFER)
+		return 0;
+	D3D12Raster *nativeRaster = GETD3D12RASTEREXT(raster);
+	if(nativeRaster->resource == nil || nativeRaster->srvGpu.ptr == 0)
+		return 0;
+	const D3D12_RESOURCE_STATES shaderRead =
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+	if(!transitionDepthRaster(raster, shaderRead))
+		return 0;
+	if(resource) *resource = nativeRaster->resource;
+	if(view) *view = nativeRaster->srvGpu;
 	return 1;
 }
 

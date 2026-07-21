@@ -646,7 +646,7 @@ createOpenXRResolveResources(ID3D12Device *device)
 	memset(params, 0, sizeof(params));
 	params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 	params[0].Constants.ShaderRegister = 0;
-	params[0].Constants.Num32BitValues = 20;
+	params[0].Constants.Num32BitValues = 24;
 	params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 	params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 	params[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -689,6 +689,7 @@ createOpenXRResolveResources(ID3D12Device *device)
 	static const char *shaderSource =
 		"cbuffer ResolveConstants : register(b0) { float2 uvScale; float2 uvOffset;"
 		" float2 inverseSourceSize; uint fxaaEnabled; uint colorMode;"
+		" float2 inverseOutputSize; float2 resolvePadding;"
 		" float4 blurColor; float4 contrastMult; float4 contrastAdd; };"
 		"Texture2D image : register(t0); SamplerState imageSampler : register(s0);"
 		"struct VSOut { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };"
@@ -706,8 +707,17 @@ createOpenXRResolveResources(ID3D12Device *device)
 		"float3 SamplePoint(float2 outputUV) {"
 		" float2 sourceUV=clamp(outputUV*uvScale+uvOffset,0.0,1.0-inverseSourceSize*0.5);"
 		" int2 texel=int2(sourceUV/inverseSourceSize); return image.Load(int3(texel,0)).rgb; }"
+		"float3 SampleDownsampled(float2 outputUV) {"
+		" float2 footprint=uvScale*inverseOutputSize;"
+		" float2 ratio=footprint/max(inverseSourceSize,float2(0.0000001,0.0000001));"
+		" if(max(ratio.x,ratio.y)<=1.05) return SampleColor(outputUV);"
+		" float2 radius=footprint*0.25;"
+		" return 0.25*(SampleColor(outputUV+float2(-radius.x,-radius.y))"
+		"             +SampleColor(outputUV+float2( radius.x,-radius.y))"
+		"             +SampleColor(outputUV+float2(-radius.x, radius.y))"
+		"             +SampleColor(outputUV+float2( radius.x, radius.y))); }"
 		"float4 PSMain(VSOut input) : SV_TARGET {"
-		" float3 middle = fxaaEnabled!=0?SampleColor(input.uv):SamplePoint(input.uv);"
+		" float3 middle = fxaaEnabled!=0?SampleColor(input.uv):SampleDownsampled(input.uv);"
 		" float2 outputTexel=inverseSourceSize/max(uvScale,float2(0.00001,0.00001));"
 		" float3 nw = SampleColor(input.uv + float2(-1.0, -1.0) * outputTexel);"
 		" float3 ne = SampleColor(input.uv + float2( 1.0, -1.0) * outputTexel);"
@@ -1459,6 +1469,8 @@ resolveRasterToExternal(Raster *source, ID3D12Resource *destination,
 		float inverseSourceSize[2];
 		uint32 fxaaEnabled;
 		uint32 colorMode;
+		float inverseOutputSize[2];
+		float resolvePadding[2];
 		float blurColor[4];
 		float contrastMult[4];
 		float contrastAdd[4];
@@ -1469,12 +1481,103 @@ resolveRasterToExternal(Raster *source, ID3D12Resource *destination,
 	constants.uvOffset[1] = uvOffsetY;
 	constants.inverseSourceSize[0] = 1.0f/(float)sourceParent->width;
 	constants.inverseSourceSize[1] = 1.0f/(float)sourceParent->height;
+	constants.inverseOutputSize[0] = 1.0f/(float)width;
+	constants.inverseOutputSize[1] = 1.0f/(float)height;
 	constants.fxaaEnabled = fxaaEnabled != 0;
 	constants.colorMode = colorMode;
 	memcpy(constants.blurColor, blurColor, sizeof(constants.blurColor));
 	memcpy(constants.contrastMult, contrastMult, 3*sizeof(float));
 	memcpy(constants.contrastAdd, contrastAdd, 3*sizeof(float));
-	list->SetGraphicsRoot32BitConstants(0, 20, &constants, 0);
+	list->SetGraphicsRoot32BitConstants(0, 24, &constants, 0);
+	list->SetGraphicsRootDescriptorTable(1, sourceView);
+	list->DrawInstanced(3, 1, 0, 0);
+	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+	list->ResourceBarrier(1, &barrier);
+	deferDescriptorRelease(UINT32_MAX, targetViewIndex, UINT32_MAX);
+	return 1;
+}
+
+bool32
+resolveTextureToExternal(ID3D12Resource *source,
+	                     D3D12_GPU_DESCRIPTOR_HANDLE sourceView,
+	                     ID3D12Resource *destination,
+	                     int32 sourceWidth, int32 sourceHeight,
+	                     int32 width, int32 height,
+	                     float32 uvScaleX, float32 uvScaleY,
+	                     float32 uvOffsetX, float32 uvOffsetY,
+	                     bool32 fxaaEnabled, uint32 colorMode,
+	                     const float32 blurColor[4],
+	                     const float32 contrastMult[3],
+	                     const float32 contrastAdd[3])
+{
+	if(!immediateReady || openXRResolvePipeline == nil ||
+	   openXRResolveRootSignature == nil || source == nil ||
+	   sourceView.ptr == 0 || destination == nil ||
+	   sourceWidth <= 0 || sourceHeight <= 0 || width <= 0 || height <= 0 ||
+	   blurColor == nil || contrastMult == nil || contrastAdd == nil)
+		return 0;
+	ID3D12Device *device = getDevice();
+	ID3D12GraphicsCommandList *list = getCommandList();
+	if(device == nil || list == nil)
+		return 0;
+	D3D12_CPU_DESCRIPTOR_HANDLE targetView;
+	uint32 targetViewIndex = UINT32_MAX;
+	if(!allocateRenderTargetDescriptor(&targetView, &targetViewIndex))
+		return 0;
+	D3D12_RENDER_TARGET_VIEW_DESC viewDesc;
+	memset(&viewDesc, 0, sizeof(viewDesc));
+	viewDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	viewDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+	device->CreateRenderTargetView(destination, &viewDesc, targetView);
+
+	D3D12_RESOURCE_BARRIER barrier;
+	memset(&barrier, 0, sizeof(barrier));
+	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barrier.Transition.pResource = destination;
+	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	list->ResourceBarrier(1, &barrier);
+	list->OMSetRenderTargets(1, &targetView, FALSE, nil);
+	D3D12_VIEWPORT viewport = {
+		0.0f, 0.0f, (float)width, (float)height, 0.0f, 1.0f
+	};
+	D3D12_RECT scissor = { 0, 0, (LONG)width, (LONG)height };
+	list->RSSetViewports(1, &viewport);
+	list->RSSetScissorRects(1, &scissor);
+	ID3D12DescriptorHeap *heap = getShaderResourceHeap();
+	if(heap)
+		list->SetDescriptorHeaps(1, &heap);
+	list->SetGraphicsRootSignature(openXRResolveRootSignature);
+	list->SetPipelineState(openXRResolvePipeline);
+	list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	struct ResolveConstants {
+		float uvScale[2];
+		float uvOffset[2];
+		float inverseSourceSize[2];
+		uint32 fxaaEnabled;
+		uint32 colorMode;
+		float inverseOutputSize[2];
+		float resolvePadding[2];
+		float blurColor[4];
+		float contrastMult[4];
+		float contrastAdd[4];
+	} constants = {};
+	constants.uvScale[0] = uvScaleX;
+	constants.uvScale[1] = uvScaleY;
+	constants.uvOffset[0] = uvOffsetX;
+	constants.uvOffset[1] = uvOffsetY;
+	constants.inverseSourceSize[0] = 1.0f/(float)sourceWidth;
+	constants.inverseSourceSize[1] = 1.0f/(float)sourceHeight;
+	constants.inverseOutputSize[0] = 1.0f/(float)width;
+	constants.inverseOutputSize[1] = 1.0f/(float)height;
+	constants.fxaaEnabled = fxaaEnabled != 0;
+	constants.colorMode = colorMode;
+	memcpy(constants.blurColor, blurColor, sizeof(constants.blurColor));
+	memcpy(constants.contrastMult, contrastMult, 3*sizeof(float));
+	memcpy(constants.contrastAdd, contrastAdd, 3*sizeof(float));
+	list->SetGraphicsRoot32BitConstants(0, 24, &constants, 0);
 	list->SetGraphicsRootDescriptorTable(1, sourceView);
 	list->DrawInstanced(3, 1, 0, 0);
 	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;

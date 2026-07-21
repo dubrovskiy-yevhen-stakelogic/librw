@@ -189,6 +189,14 @@ struct D3D12Context
 	std::vector<uint32> freeDsvDescriptors;
 };
 
+static DeviceCreatedCallback deviceCreatedCallback;
+
+void
+setDeviceCreatedCallback(DeviceCreatedCallback callback)
+{
+	deviceCreatedCallback = callback;
+}
+
 static D3D12Context context;
 static uint32 externalCopyLogCount;
 static FrameSyncProfile frameSyncProfile;
@@ -1992,6 +2000,12 @@ createCoreDevice(void)
 		destroyCoreDevice();
 		return 0;
 	}
+	// Streamline requires slSetD3DDevice before any hooked device method (most
+	// importantly CreateCommandQueue) is invoked.  Waiting until the OpenXR
+	// session starts is already too late and leaves the temporal plugin only
+	// partially initialized.
+	if(deviceCreatedCallback)
+		deviceCreatedCallback();
 	D3D12_FEATURE_DATA_D3D12_OPTIONS6 options6;
 	memset(&options6, 0, sizeof(options6));
 	if(SUCCEEDED(context.device->CheckFeatureSupport(
