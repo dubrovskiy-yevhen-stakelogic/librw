@@ -716,9 +716,25 @@ uploadRgbaToExternal(ID3D12Resource *destination, const uint8 *pixels,
 	                 uint32 stride, int32 width, int32 height)
 {
 	if(destination == nil || pixels == nil || context.device == nil ||
-	   context.commandList == nil || !context.frameOpen ||
+	   context.queue == nil ||
 	   width <= 0 || height <= 0 || stride < (uint32)width*4)
 		return 0;
+	const bool32 standalone = !context.frameOpen;
+	ID3D12CommandAllocator *standaloneAllocator = nil;
+	ID3D12GraphicsCommandList *commandList = context.commandList;
+	if(standalone){
+		commandList = nil;
+		if(FAILED(context.device->CreateCommandAllocator(
+		   D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&standaloneAllocator))) ||
+		   FAILED(context.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+		   standaloneAllocator, nil, IID_PPV_ARGS(&commandList)))){
+			releaseCom(commandList);
+			releaseCom(standaloneAllocator);
+			return 0;
+		}
+	}else if(commandList == nil){
+		return 0;
+	}
 	D3D12_RESOURCE_DESC texture = destination->GetDesc();
 	if(texture.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
 	   texture.Width != (UINT64)width || texture.Height != (UINT)height ||
@@ -748,12 +764,17 @@ uploadRgbaToExternal(ID3D12Resource *destination, const uint8 *pixels,
 	ID3D12Resource *upload = nil;
 	if(FAILED(context.device->CreateCommittedResource(
 	   &heap, D3D12_HEAP_FLAG_NONE, &buffer,
-	   D3D12_RESOURCE_STATE_GENERIC_READ, nil, IID_PPV_ARGS(&upload))))
+	   D3D12_RESOURCE_STATE_GENERIC_READ, nil, IID_PPV_ARGS(&upload)))){
+		if(standalone) releaseCom(commandList);
+		releaseCom(standaloneAllocator);
 		return 0;
+	}
 	uint8 *mapped = nil;
 	D3D12_RANGE readRange = { 0, 0 };
 	if(FAILED(upload->Map(0, &readRange, (void**)&mapped))){
 		releaseCom(upload);
+		if(standalone) releaseCom(commandList);
+		releaseCom(standaloneAllocator);
 		return 0;
 	}
 	const uint32 copyBytes = (uint32)width*4;
@@ -765,7 +786,7 @@ uploadRgbaToExternal(ID3D12Resource *destination, const uint8 *pixels,
 	D3D12_RESOURCE_BARRIER barrier = transitionBarrier(
 		destination, D3D12_RESOURCE_STATE_COMMON,
 		D3D12_RESOURCE_STATE_COPY_DEST);
-	context.commandList->ResourceBarrier(1, &barrier);
+	commandList->ResourceBarrier(1, &barrier);
 	D3D12_TEXTURE_COPY_LOCATION source = {};
 	source.pResource = upload;
 	source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -774,12 +795,24 @@ uploadRgbaToExternal(ID3D12Resource *destination, const uint8 *pixels,
 	target.pResource = destination;
 	target.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 	target.SubresourceIndex = 0;
-	context.commandList->CopyTextureRegion(&target, 0, 0, 0, &source, nil);
+	commandList->CopyTextureRegion(&target, 0, 0, 0, &source, nil);
 	barrier = transitionBarrier(destination, D3D12_RESOURCE_STATE_COPY_DEST,
 	                           D3D12_RESOURCE_STATE_COMMON);
-	context.commandList->ResourceBarrier(1, &barrier);
-	deferRelease(upload);
-	return 1;
+	commandList->ResourceBarrier(1, &barrier);
+	if(!standalone){
+		deferRelease(upload);
+		return 1;
+	}
+	bool32 ok = SUCCEEDED(commandList->Close());
+	if(ok){
+		ID3D12CommandList *lists[] = { commandList };
+		context.queue->ExecuteCommandLists(1, lists);
+		ok = waitForGpu();
+	}
+	releaseCom(upload);
+	releaseCom(commandList);
+	releaseCom(standaloneAllocator);
+	return ok;
 }
 
 static void
