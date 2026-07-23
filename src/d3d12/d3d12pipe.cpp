@@ -1095,6 +1095,11 @@ fillInstanceVertices(Geometry *geometry, Vertex *vertices)
 			vertices[i].normal.set(0.0f, 0.0f, 1.0f);
 		if((geometry->flags & Geometry::PRELIT) && geometry->colors)
 			vertices[i].color = geometry->colors[i];
+		else if(geometry->flags & Geometry::LIGHT)
+			// Lit non-prelit geometry has no emissive vertex contribution. White
+			// saturated the shader before ambient/directional lighting, so the
+			// original scorched-vehicle lighting could never darken wrecks.
+			vertices[i].color = makeRGBA(0, 0, 0, 255);
 		else
 			vertices[i].color = makeRGBA(255, 255, 255, 255);
 		if(geometry->numTexCoordSets > 0 && geometry->texCoords[0])
