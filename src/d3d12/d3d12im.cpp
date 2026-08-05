@@ -1442,14 +1442,9 @@ resolveRasterToExternal(Raster *source, ID3D12Resource *destination,
 	viewDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
 	device->CreateRenderTargetView(destination, &viewDesc, targetView);
 
-	D3D12_RESOURCE_BARRIER barrier;
-	memset(&barrier, 0, sizeof(barrier));
-	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	barrier.Transition.pResource = destination;
-	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-	list->ResourceBarrier(1, &barrier);
+	// XrSwapchainImageD3D12KHR color images are acquired in RENDER_TARGET and
+	// must be released in RENDER_TARGET.  Do not transition them through COMMON:
+	// that is undefined by XR_KHR_D3D12_enable and VDXR rejects the session.
 	list->OMSetRenderTargets(1, &targetView, FALSE, nil);
 	D3D12_VIEWPORT viewport = {
 		0.0f, 0.0f, (float)width, (float)height, 0.0f, 1.0f
@@ -1491,9 +1486,6 @@ resolveRasterToExternal(Raster *source, ID3D12Resource *destination,
 	list->SetGraphicsRoot32BitConstants(0, 24, &constants, 0);
 	list->SetGraphicsRootDescriptorTable(1, sourceView);
 	list->DrawInstanced(3, 1, 0, 0);
-	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-	list->ResourceBarrier(1, &barrier);
 	deferDescriptorRelease(UINT32_MAX, targetViewIndex, UINT32_MAX);
 	return 1;
 }
@@ -1531,14 +1523,8 @@ resolveTextureToExternal(ID3D12Resource *source,
 	viewDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
 	device->CreateRenderTargetView(destination, &viewDesc, targetView);
 
-	D3D12_RESOURCE_BARRIER barrier;
-	memset(&barrier, 0, sizeof(barrier));
-	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	barrier.Transition.pResource = destination;
-	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-	list->ResourceBarrier(1, &barrier);
+	// The OpenXR runtime transfers this image to us in RENDER_TARGET state and
+	// requires the same state back when xrReleaseSwapchainImage is called.
 	list->OMSetRenderTargets(1, &targetView, FALSE, nil);
 	D3D12_VIEWPORT viewport = {
 		0.0f, 0.0f, (float)width, (float)height, 0.0f, 1.0f
@@ -1580,9 +1566,6 @@ resolveTextureToExternal(ID3D12Resource *source,
 	list->SetGraphicsRoot32BitConstants(0, 24, &constants, 0);
 	list->SetGraphicsRootDescriptorTable(1, sourceView);
 	list->DrawInstanced(3, 1, 0, 0);
-	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-	list->ResourceBarrier(1, &barrier);
 	deferDescriptorRelease(UINT32_MAX, targetViewIndex, UINT32_MAX);
 	return 1;
 }

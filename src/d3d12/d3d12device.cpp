@@ -641,8 +641,6 @@ copyCurrentBackBufferToExternal(ID3D12Resource *destination)
 	D3D12_RESOURCE_DESC sourceDesc = source->GetDesc();
 	D3D12_RESOURCE_DESC destinationDesc = destination->GetDesc();
 	if(sourceDesc.Dimension != destinationDesc.Dimension ||
-	   sourceDesc.Width != destinationDesc.Width ||
-	   sourceDesc.Height != destinationDesc.Height ||
 	   !areCopyCompatibleFormats(sourceDesc.Format, destinationDesc.Format) ||
 	   sourceDesc.SampleDesc.Count != destinationDesc.SampleDesc.Count){
 		logExternalCopy("resource mismatch", &sourceDesc, &destinationDesc);
@@ -671,15 +669,31 @@ copyCurrentBackBufferToExternal(ID3D12Resource *destination)
 			D3D12_RESOURCE_BARRIER barriers[2] = {
 				transitionBarrier(source, D3D12_RESOURCE_STATE_PRESENT,
 				                  D3D12_RESOURCE_STATE_COPY_SOURCE),
-				transitionBarrier(destination, D3D12_RESOURCE_STATE_COMMON,
+				transitionBarrier(destination, D3D12_RESOURCE_STATE_RENDER_TARGET,
 				                  D3D12_RESOURCE_STATE_COPY_DEST)
 			};
 			list->ResourceBarrier(2, barriers);
-			list->CopyResource(destination, source);
+			if(sourceDesc.Width == destinationDesc.Width &&
+			   sourceDesc.Height == destinationDesc.Height)
+				list->CopyResource(destination, source);
+			else{
+				D3D12_TEXTURE_COPY_LOCATION dst = {};
+				dst.pResource = destination;
+				dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+				D3D12_TEXTURE_COPY_LOCATION src = {};
+				src.pResource = source;
+				src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+				D3D12_BOX box = { 0, 0, 0,
+					(UINT)(sourceDesc.Width < destinationDesc.Width ?
+					 sourceDesc.Width : destinationDesc.Width),
+					(UINT)(sourceDesc.Height < destinationDesc.Height ?
+					 sourceDesc.Height : destinationDesc.Height), 1 };
+				list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+			}
 			barriers[0] = transitionBarrier(source, D3D12_RESOURCE_STATE_COPY_SOURCE,
 			                                D3D12_RESOURCE_STATE_PRESENT);
 			barriers[1] = transitionBarrier(destination, D3D12_RESOURCE_STATE_COPY_DEST,
-			                                D3D12_RESOURCE_STATE_COMMON);
+			                                D3D12_RESOURCE_STATE_RENDER_TARGET);
 			list->ResourceBarrier(2, barriers);
 			ok = SUCCEEDED(list->Close());
 		}
@@ -698,15 +712,31 @@ copyCurrentBackBufferToExternal(ID3D12Resource *destination)
 	D3D12_RESOURCE_BARRIER barriers[2] = {
 		transitionBarrier(source, D3D12_RESOURCE_STATE_RENDER_TARGET,
 		                  D3D12_RESOURCE_STATE_COPY_SOURCE),
-		transitionBarrier(destination, D3D12_RESOURCE_STATE_COMMON,
+		transitionBarrier(destination, D3D12_RESOURCE_STATE_RENDER_TARGET,
 		                  D3D12_RESOURCE_STATE_COPY_DEST)
 	};
 	context.commandList->ResourceBarrier(2, barriers);
-	context.commandList->CopyResource(destination, source);
+	if(sourceDesc.Width == destinationDesc.Width &&
+	   sourceDesc.Height == destinationDesc.Height)
+		context.commandList->CopyResource(destination, source);
+	else{
+		D3D12_TEXTURE_COPY_LOCATION dst = {};
+		dst.pResource = destination;
+		dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		D3D12_TEXTURE_COPY_LOCATION src = {};
+		src.pResource = source;
+		src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		D3D12_BOX box = { 0, 0, 0,
+			(UINT)(sourceDesc.Width < destinationDesc.Width ?
+			 sourceDesc.Width : destinationDesc.Width),
+			(UINT)(sourceDesc.Height < destinationDesc.Height ?
+			 sourceDesc.Height : destinationDesc.Height), 1 };
+		context.commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+	}
 	barriers[0] = transitionBarrier(source, D3D12_RESOURCE_STATE_COPY_SOURCE,
 	                                D3D12_RESOURCE_STATE_RENDER_TARGET);
 	barriers[1] = transitionBarrier(destination, D3D12_RESOURCE_STATE_COPY_DEST,
-	                                D3D12_RESOURCE_STATE_COMMON);
+	                                D3D12_RESOURCE_STATE_RENDER_TARGET);
 	context.commandList->ResourceBarrier(2, barriers);
 	return 1;
 }
@@ -737,15 +767,18 @@ uploadRgbaToExternal(ID3D12Resource *destination, const uint8 *pixels,
 	}
 	D3D12_RESOURCE_DESC texture = destination->GetDesc();
 	if(texture.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-	   texture.Width != (UINT64)width || texture.Height != (UINT)height ||
+	   texture.Width < (UINT64)width || texture.Height < (UINT)height ||
 	   !areCopyCompatibleFormats(DXGI_FORMAT_R8G8B8A8_UNORM, texture.Format))
 		return 0;
 
+	D3D12_RESOURCE_DESC uploadTexture = texture;
+	uploadTexture.Width = width;
+	uploadTexture.Height = height;
 	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
 	UINT rows = 0;
 	UINT64 rowSize = 0;
 	UINT64 uploadSize = 0;
-	context.device->GetCopyableFootprints(&texture, 0, 1, 0, &footprint,
+	context.device->GetCopyableFootprints(&uploadTexture, 0, 1, 0, &footprint,
 	                                     &rows, &rowSize, &uploadSize);
 	D3D12_HEAP_PROPERTIES heap = {};
 	heap.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -784,7 +817,7 @@ uploadRgbaToExternal(ID3D12Resource *destination, const uint8 *pixels,
 	upload->Unmap(0, nil);
 
 	D3D12_RESOURCE_BARRIER barrier = transitionBarrier(
-		destination, D3D12_RESOURCE_STATE_COMMON,
+		destination, D3D12_RESOURCE_STATE_RENDER_TARGET,
 		D3D12_RESOURCE_STATE_COPY_DEST);
 	commandList->ResourceBarrier(1, &barrier);
 	D3D12_TEXTURE_COPY_LOCATION source = {};
@@ -797,7 +830,7 @@ uploadRgbaToExternal(ID3D12Resource *destination, const uint8 *pixels,
 	target.SubresourceIndex = 0;
 	commandList->CopyTextureRegion(&target, 0, 0, 0, &source, nil);
 	barrier = transitionBarrier(destination, D3D12_RESOURCE_STATE_COPY_DEST,
-	                           D3D12_RESOURCE_STATE_COMMON);
+	                           D3D12_RESOURCE_STATE_RENDER_TARGET);
 	commandList->ResourceBarrier(1, &barrier);
 	if(!standalone){
 		deferRelease(upload);
